@@ -22,13 +22,7 @@ import io.moquette.broker.SessionRegistry.PublishedMessage;
 import io.moquette.broker.subscriptions.Subscription;
 import io.moquette.broker.subscriptions.Topic;
 import io.netty.buffer.ByteBuf;
-import io.netty.handler.codec.mqtt.MqttFixedHeader;
-import io.netty.handler.codec.mqtt.MqttMessage;
-import io.netty.handler.codec.mqtt.MqttMessageType;
-import io.netty.handler.codec.mqtt.MqttPublishMessage;
-import io.netty.handler.codec.mqtt.MqttPublishVariableHeader;
-import io.netty.handler.codec.mqtt.MqttQoS;
-import io.netty.handler.codec.mqtt.MqttVersion;
+import io.netty.handler.codec.mqtt.*;
 import io.netty.util.ReferenceCountUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -90,23 +84,7 @@ class Session {
         CONNECTED, CONNECTING, DISCONNECTING, DISCONNECTED, DESTROYED
     }
 
-    static final class Will {
-
-        final String topic;
-        final ByteBuf payload;
-        final MqttQoS qos;
-        final boolean retained;
-
-        Will(String topic, ByteBuf payload, MqttQoS qos, boolean retained) {
-            this.topic = topic;
-            this.payload = payload;
-            this.qos = qos;
-            this.retained = retained;
-        }
-    }
-
     private boolean clean;
-    private Will will;
     private final SessionMessageQueue<SessionRegistry.EnqueuedMessage> sessionQueue;
     private final AtomicReference<SessionStatus> status = new AtomicReference<>(SessionStatus.DISCONNECTED);
     private MQTTConnection mqttConnection;
@@ -116,12 +94,7 @@ class Session {
     private final DelayQueue<InFlightPacket> inflightTimeouts = new DelayQueue<>();
     private final Map<Integer, MqttPublishMessage> qos2Receiving = new HashMap<>();
     private final AtomicInteger inflightSlots = new AtomicInteger(INFLIGHT_WINDOW_SIZE); // this should be configurable
-    private final ISessionsRepository.SessionData data;
-
-    Session(ISessionsRepository.SessionData data, boolean clean, Will will, SessionMessageQueue<SessionRegistry.EnqueuedMessage> sessionQueue) {
-        this(data, clean, sessionQueue);
-        this.will = will;
-    }
+    private ISessionsRepository.SessionData data;
 
     Session(ISessionsRepository.SessionData data, boolean clean, SessionMessageQueue<SessionRegistry.EnqueuedMessage> sessionQueue) {
         if (sessionQueue == null) {
@@ -139,9 +112,12 @@ class Session {
         return data.expiryInterval() == 0;
     }
 
-    void update(boolean clean, Will will) {
-        this.clean = clean;
-        this.will = will;
+    public void updateSessionData(ISessionsRepository.SessionData newSessionData) {
+        this.data = newSessionData;
+    }
+
+    void markAsNotClean() {
+        this.clean = false;
     }
 
     void markConnecting() {
@@ -185,11 +161,11 @@ class Session {
     }
 
     public boolean hasWill() {
-        return will != null;
+        return getSessionData().hasWill();
     }
 
-    public Will getWill() {
-        return will;
+    public ISessionsRepository.Will getWill() {
+        return getSessionData().will();
     }
 
     boolean assignState(SessionStatus expected, SessionStatus newState) {
@@ -211,7 +187,7 @@ class Session {
         }
 
         mqttConnection = null;
-        will = null;
+        updateSessionData(data.withoutWill());
 
         assignState(SessionStatus.DISCONNECTING, SessionStatus.DISCONNECTED);
     }
@@ -532,6 +508,14 @@ class Session {
 
     ISessionsRepository.SessionData getSessionData() {
         return this.data;
+    }
+
+    /**
+     * Disconnect the client from the broker, sending a disconnect and closing the connection
+     * */
+    public void disconnectFromBroker() {
+        mqttConnection.brokerDisconnect(MqttReasonCodes.Disconnect.MALFORMED_PACKET);
+        disconnect();
     }
 
     @Override

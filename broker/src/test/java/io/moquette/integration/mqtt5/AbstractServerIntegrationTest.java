@@ -16,17 +16,17 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Properties;
 
-abstract class AbstractServerIntegrationTest {
+public abstract class AbstractServerIntegrationTest {
     Server broker;
     IConfig config;
 
     @TempDir
     Path tempFolder;
-    private String dbPath;
+    protected String dbPath;
 
     Client lowLevelClient;
 
-    abstract String clientName();
+    public abstract String clientName();
 
     protected void startServer(String dbPath) throws IOException {
         broker = new Server();
@@ -53,7 +53,7 @@ abstract class AbstractServerIntegrationTest {
         stopServer();
     }
 
-    private void stopServer() {
+    protected void stopServer() {
         broker.stopServer();
     }
 }

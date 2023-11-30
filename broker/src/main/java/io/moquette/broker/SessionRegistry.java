@@ -16,11 +16,11 @@
 package io.moquette.broker;
 
 import io.moquette.broker.Session.SessionStatus;
+import io.moquette.broker.scheduler.ScheduledExpirationService;
 import io.moquette.broker.subscriptions.ISubscriptionsDirectory;
 import io.moquette.broker.subscriptions.Subscription;
 import io.moquette.broker.subscriptions.Topic;
 import io.netty.buffer.ByteBuf;
-import io.netty.buffer.Unpooled;
 import io.netty.handler.codec.mqtt.MqttConnectMessage;
 import io.netty.handler.codec.mqtt.MqttProperties;
 import io.netty.handler.codec.mqtt.MqttQoS;
@@ -32,28 +32,20 @@ import java.net.InetSocketAddress;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.List;
-import java.util.Optional;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.DelayQueue;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 import static io.moquette.broker.Session.INFINITE_EXPIRY;
 
 public class SessionRegistry {
 
-    private final ScheduledFuture<?> scheduledExpiredSessions;
     private int globalExpirySeconds;
     private final SessionEventLoopGroup loopsGroup;
     static final Duration EXPIRED_SESSION_CLEANER_TASK_INTERVAL = Duration.ofSeconds(1);
+    private ScheduledExpirationService<ISessionsRepository.SessionData> sessionExpirationService;
 
     public abstract static class EnqueuedMessage {
 
@@ -137,7 +129,6 @@ public class SessionRegistry {
     private final ISessionsRepository sessionsRepository;
     private final IQueueRepository queueRepository;
     private final Authorizator authorizator;
-    private final DelayQueue<ISessionsRepository.SessionData> removableSessions = new DelayQueue<>();
     private final Clock clock;
 
     // Used in testing
@@ -161,37 +152,27 @@ public class SessionRegistry {
         this.sessionsRepository = sessionsRepository;
         this.queueRepository = queueRepository;
         this.authorizator = authorizator;
-        this.scheduledExpiredSessions = scheduler.scheduleWithFixedDelay(this::checkExpiredSessions,
-            EXPIRED_SESSION_CLEANER_TASK_INTERVAL.getSeconds(), EXPIRED_SESSION_CLEANER_TASK_INTERVAL.getSeconds(),
-            TimeUnit.SECONDS);
+        sessionExpirationService = new ScheduledExpirationService<>(clock, this::removeExpiredSession);
         this.clock = clock;
         this.globalExpirySeconds = globalExpirySeconds;
         this.loopsGroup = loopsGroup;
         recreateSessionPool();
     }
 
-    private void checkExpiredSessions() {
-        List<ISessionsRepository.SessionData> expiredSessions = new ArrayList<>();
-        int drainedSessions = removableSessions.drainTo(expiredSessions);
-        LOG.debug("Retrieved {} expired sessions or {}", drainedSessions, removableSessions.size());
-        for (ISessionsRepository.SessionData expiredSession : expiredSessions) {
-            final String expiredAt = expiredSession.expireAt().map(Instant::toString).orElse("UNDEFINED");
-            LOG.debug("Removing session {}, expired on {}", expiredSession.clientId(), expiredAt);
-            remove(expiredSession.clientId());
-            sessionsRepository.delete(expiredSession);
-        }
+    private void removeExpiredSession(ISessionsRepository.SessionData expiredSession) {
+        final String expiredAt = expiredSession.expireAt().map(Instant::toString).orElse("UNDEFINED");
+        LOG.debug("Removing session {}, expired on {}", expiredSession.clientId(), expiredAt);
+        remove(expiredSession.clientId());
+        sessionsRepository.delete(expiredSession);
     }
 
     private void trackForRemovalOnExpiration(ISessionsRepository.SessionData session) {
-        if (!session.expireAt().isPresent()) {
-            throw new RuntimeException("Can't track for expiration a session without expiry instant, client_id: " + session.clientId());
-        }
         LOG.debug("start tracking the session {} for removal", session.clientId());
-        removableSessions.add(session);
+        sessionExpirationService.track(session.clientId(), session);
     }
 
     private void untrackFromRemovalOnExpiration(ISessionsRepository.SessionData session) {
-        removableSessions.remove(session);
+        sessionExpirationService.untrack(session.clientId());
     }
 
     private void recreateSessionPool() {
@@ -203,6 +184,7 @@ public class SessionRegistry {
                 queues.remove(session.clientId());
                 Session rehydrated = new Session(session, false, persistentQueue);
                 pool.put(session.clientId(), rehydrated);
+
                 trackForRemovalOnExpiration(session);
             }
         }
@@ -258,7 +240,16 @@ public class SessionRegistry {
                 throw new SessionCorruptedException("old session moved in connected state by other thread");
             }
             // case 3, reopening existing session not clean session, so keep the existing subscriptions
-            copySessionConfig(msg, oldSession);
+            boolean hasWillFlag = msg.variableHeader().isWillFlag();
+            ISessionsRepository.SessionData newSessionData = oldSession.getSessionData();
+            if (hasWillFlag) {
+                newSessionData = newSessionData.withWill(createNewWill(msg));
+            } else {
+                newSessionData = newSessionData.withoutWill();
+            }
+            oldSession.updateSessionData(newSessionData);
+            oldSession.markAsNotClean();
+
             reactivateSubscriptions(oldSession, username);
 
             LOG.trace("case 3, oldSession with same CId {} disconnected", clientId);
@@ -317,37 +308,81 @@ public class SessionRegistry {
                 expiryInterval = clean ? 0 : globalExpirySeconds;
             }
         }
-        final ISessionsRepository.SessionData sessionData = new ISessionsRepository.SessionData(clientId,
-            mqttVersion, expiryInterval, clock);
+        final ISessionsRepository.SessionData sessionData;
         if (msg.variableHeader().isWillFlag()) {
-            final Session.Will will = createWill(msg);
-            newSession = new Session(sessionData, clean, will, queue);
+            final ISessionsRepository.Will will = createNewWill(msg);
+            sessionData = new ISessionsRepository.SessionData(clientId, mqttVersion, will, expiryInterval, clock);
         } else {
-            newSession = new Session(sessionData, clean, queue);
+            sessionData = new ISessionsRepository.SessionData(clientId, mqttVersion, expiryInterval, clock);
         }
 
+        newSession = new Session(sessionData, clean, queue);
         newSession.markConnecting();
         sessionsRepository.saveSession(sessionData);
         return newSession;
     }
 
-    private void copySessionConfig(MqttConnectMessage msg, Session session) {
-        final boolean clean = msg.variableHeader().isCleanSession();
-        final Session.Will will;
-        if (msg.variableHeader().isWillFlag()) {
-            will = createWill(msg);
-        } else {
-            will = null;
-        }
-        session.update(clean, will);
-    }
-
-    private Session.Will createWill(MqttConnectMessage msg) {
-        final ByteBuf willPayload = Unpooled.copiedBuffer(msg.payload().willMessageInBytes());
+    private ISessionsRepository.Will createNewWill(MqttConnectMessage msg) {
+        final byte[] willPayload = msg.payload().willMessageInBytes();
         final String willTopic = msg.payload().willTopic();
         final boolean retained = msg.variableHeader().isWillRetain();
         final MqttQoS qos = MqttQoS.valueOf(msg.variableHeader().willQos());
-        return new Session.Will(willTopic, willPayload, qos, retained);
+
+        if (Utils.versionFromConnect(msg) != MqttVersion.MQTT_5) {
+            return new ISessionsRepository.Will(willTopic, willPayload, qos, retained, 0);
+        }
+
+        // retrieve Will Delay if present and if the connection is MQTT5
+        final int willDelayIntervalSeconds;
+        MqttProperties willProperties = msg.payload().willProperties();
+        final MqttProperties.MqttProperty<Integer> willDelayIntervalProperty =
+            willProperties.getProperty(MqttProperties.MqttPropertyType.WILL_DELAY_INTERVAL.value());
+        if (willDelayIntervalProperty != null) {
+            willDelayIntervalSeconds = willDelayIntervalProperty.value();
+        } else {
+            willDelayIntervalSeconds = 0;
+        }
+        ISessionsRepository.Will will = new ISessionsRepository.Will(willTopic, willPayload, qos, retained, willDelayIntervalSeconds);
+
+        ISessionsRepository.WillOptions options = ISessionsRepository.WillOptions.empty();
+        MqttProperties.MqttProperty<Integer> messageExpiryIntervalProperty =
+            willProperties.getProperty(MqttProperties.MqttPropertyType.PUBLICATION_EXPIRY_INTERVAL.value());
+        if (messageExpiryIntervalProperty != null) {
+            Integer messageExpiryIntervalSeconds = messageExpiryIntervalProperty.value();
+            options = options.withMessageExpiry(Duration.ofSeconds(messageExpiryIntervalSeconds));
+        }
+
+        MqttProperties.MqttProperty<String> contentTypeProperty =
+            willProperties.getProperty(MqttProperties.MqttPropertyType.CONTENT_TYPE.value());
+        if (contentTypeProperty != null) {
+            options = options.withContentType(contentTypeProperty.value());
+        }
+
+        MqttProperties.MqttProperty<String> responseTopicProperty =
+            willProperties.getProperty(MqttProperties.MqttPropertyType.RESPONSE_TOPIC.value());
+        if (responseTopicProperty != null) {
+            options = options.withResponseTopic(responseTopicProperty.value());
+        }
+
+        MqttProperties.MqttProperty<byte[]> correlationDataProperty =
+            willProperties.getProperty(MqttProperties.MqttPropertyType.CORRELATION_DATA.value());
+        if (correlationDataProperty != null) {
+            options = options.withCorrelationData(correlationDataProperty.value());
+        }
+
+        List<? extends MqttProperties.MqttProperty> userProperties = willProperties.getProperties(MqttProperties.MqttPropertyType.USER_PROPERTY.value());
+        if (userProperties != null && !userProperties.isEmpty()) {
+            Map<String, String> props = new HashMap<>(userProperties.size());
+            for (MqttProperties.UserProperty userProperty: (List<MqttProperties.UserProperty>) userProperties) {
+                props.put(userProperty.value().key, userProperty.value().value);
+            }
+            options = options.withUserProperties(props);
+        }
+        if (options.notEmpty()) {
+            return new ISessionsRepository.Will(will, options);
+        } else {
+            return will;
+        }
     }
 
     Session retrieve(String clientID) {
@@ -360,7 +395,8 @@ public class SessionRegistry {
             purgeSessionState(session);
         } else {
             //bound session has expiry, disconnect it and add to the queue for removal
-            trackForRemovalOnExpiration(session.getSessionData().withExpirationComputed());
+            ISessionsRepository.SessionData sessionData = session.getSessionData().withExpirationComputed();
+            trackForRemovalOnExpiration(sessionData);
         }
     }
 
@@ -379,7 +415,7 @@ public class SessionRegistry {
         final Session old = pool.remove(clientID);
         if (old != null) {
             // remove from expired tracker if present
-            removableSessions.remove(old.getSessionData());
+            sessionExpirationService.untrack(clientID);
             loopsGroup.routeCommand(clientID, "Clean up removed session", () -> {
                 old.cleanUp();
                 return null;
@@ -434,12 +470,7 @@ public class SessionRegistry {
      * Close all resources related to session management
      */
     public void close() {
-        if (scheduledExpiredSessions.cancel(false)) {
-            LOG.info("Successfully cancelled expired sessions task");
-        } else {
-            LOG.warn("Can't cancel the execution of expired sessions task, was already cancelled? {}, was done? {}",
-                scheduledExpiredSessions.isCancelled(), scheduledExpiredSessions.isDone());
-        }
+        sessionExpirationService.shutdown();
         // Update all not clean session with the proper expiry date
         updateNotCleanSessionsWithProperExpire();
         queueRepository.close();

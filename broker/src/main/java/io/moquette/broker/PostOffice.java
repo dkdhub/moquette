@@ -15,17 +15,28 @@
  */
 package io.moquette.broker;
 
+import io.moquette.broker.scheduler.ScheduledExpirationService;
 import io.moquette.interception.BrokerInterceptor;
 import io.moquette.broker.subscriptions.ISubscriptionsDirectory;
 import io.moquette.broker.subscriptions.Subscription;
 import io.moquette.broker.subscriptions.Topic;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
-import io.netty.handler.codec.mqtt.*;
+import io.netty.handler.codec.mqtt.MqttConnectMessage;
+import io.netty.handler.codec.mqtt.MqttFixedHeader;
+import io.netty.handler.codec.mqtt.MqttMessageType;
+import io.netty.handler.codec.mqtt.MqttPublishMessage;
+import io.netty.handler.codec.mqtt.MqttQoS;
+import io.netty.handler.codec.mqtt.MqttSubAckMessage;
+import io.netty.handler.codec.mqtt.MqttSubAckPayload;
+import io.netty.handler.codec.mqtt.MqttSubscribeMessage;
+import io.netty.handler.codec.mqtt.MqttTopicSubscription;
 import io.netty.util.ReferenceCountUtil;
+import org.apache.commons.codec.binary.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Clock;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -42,7 +53,10 @@ import java.util.stream.Collectors;
 
 import static io.moquette.broker.Utils.messageId;
 import static io.netty.handler.codec.mqtt.MqttMessageIdVariableHeader.from;
-import static io.netty.handler.codec.mqtt.MqttQoS.*;
+import static io.netty.handler.codec.mqtt.MqttQoS.AT_LEAST_ONCE;
+import static io.netty.handler.codec.mqtt.MqttQoS.AT_MOST_ONCE;
+import static io.netty.handler.codec.mqtt.MqttQoS.EXACTLY_ONCE;
+import static io.netty.handler.codec.mqtt.MqttQoS.FAILURE;
 
 class PostOffice {
 
@@ -178,35 +192,106 @@ class PostOffice {
     private final Authorizator authorizator;
     private final ISubscriptionsDirectory subscriptions;
     private final IRetainedRepository retainedRepository;
+    private final ISessionsRepository sessionRepository;
     private SessionRegistry sessionRegistry;
     private BrokerInterceptor interceptor;
     private final FailedPublishCollection failedPublishes = new FailedPublishCollection();
     private final SessionEventLoopGroup sessionLoops;
+    private final Clock clock;
+    private final ScheduledExpirationService<ISessionsRepository.Will> willExpirationService;
+
+    /**
+     * Used only in tests
+     * */
+    PostOffice(ISubscriptionsDirectory subscriptions, IRetainedRepository retainedRepository,
+               SessionRegistry sessionRegistry, ISessionsRepository sessionRepository, BrokerInterceptor interceptor, Authorizator authorizator,
+               SessionEventLoopGroup sessionLoops) {
+        this(subscriptions, retainedRepository, sessionRegistry, sessionRepository, interceptor, authorizator, sessionLoops, Clock.systemDefaultZone());
+    }
 
     PostOffice(ISubscriptionsDirectory subscriptions, IRetainedRepository retainedRepository,
-               SessionRegistry sessionRegistry, BrokerInterceptor interceptor, Authorizator authorizator,
-               SessionEventLoopGroup sessionLoops) {
+               SessionRegistry sessionRegistry, ISessionsRepository sessionRepository, BrokerInterceptor interceptor,
+               Authorizator authorizator,
+               SessionEventLoopGroup sessionLoops, Clock clock) {
         this.authorizator = authorizator;
         this.subscriptions = subscriptions;
         this.retainedRepository = retainedRepository;
+        this.sessionRepository = sessionRepository;
         this.sessionRegistry = sessionRegistry;
         this.interceptor = interceptor;
         this.sessionLoops = sessionLoops;
+        this.clock = clock;
+
+        this.willExpirationService = new ScheduledExpirationService<>(clock, this::publishWill);
+        recreateWillExpires(sessionRepository);
     }
 
-    public void init(SessionRegistry sessionRegistry) {
-        this.sessionRegistry = sessionRegistry;
+    private void recreateWillExpires(ISessionsRepository sessionRepository) {
+        sessionRepository.listSessionsWill(willExpirationService::track);
     }
 
-    public void fireWill(Session.Will will) {
-        // MQTT 3.1.2.8-17
-        publish2Subscribers(will.payload, new Topic(will.topic), will.qos);
+    public void fireWill(Session bindedSession) {
+        final ISessionsRepository.Will will =  bindedSession.getWill();
+        final String clientId = bindedSession.getClientID();
+
+        if (will.delayInterval == 0) {
+            // if interval is 0 fire immediately
+            // MQTT3  3.1.2.8-17
+            publishWill(will);
+        } else {
+            // MQTT5 MQTT-3.1.3-9
+            final int executionInterval = Math.min(bindedSession.getSessionData().expiryInterval(), will.delayInterval);
+
+            trackWillSpecificationForFutureFire(bindedSession, will, clientId, executionInterval);
+
+            LOG.debug("Scheduled will message for client {} on topic {}", clientId, will.topic);
+        }
+    }
+
+    private void trackWillSpecificationForFutureFire(Session bindedSession, ISessionsRepository.Will will, String clientId, int executionInterval) {
+        // Update Session's SessionData with a new Will with computed expiration
+        final ISessionsRepository.Will willWithEOL = will.withExpirationComputed(executionInterval, clock);
+        // save the will in the will store
+        sessionRepository.saveWill(bindedSession.getClientID(), willWithEOL);
+        willExpirationService.track(clientId, willWithEOL);
+    }
+
+    private void publishWill(ISessionsRepository.Will will) {
+        publish2Subscribers(Unpooled.copiedBuffer(will.payload), new Topic(will.topic), will.qos);
+    }
+
+    /**
+     * Wipe the eventual existing will delayed publish tasks.
+     *
+     * @param clientId session's Id.
+     * */
+    public void wipeExistingScheduledWill(String clientId) {
+        if (willExpirationService.untrack(clientId)) {
+            LOG.debug("Wiped task to delayed publish for old client {}", clientId);
+        }
+
+        sessionRepository.deleteWill(clientId);
     }
 
     public void subscribeClientToTopics(MqttSubscribeMessage msg, String clientID, String username,
                                         MQTTConnection mqttConnection) {
         // verify which topics of the subscribe ongoing has read access permission
         int messageID = messageId(msg);
+        final Session session = sessionRegistry.retrieve(clientID);
+
+        if (mqttConnection.isProtocolVersion5()) {
+            for (MqttTopicSubscription topicFilter : msg.payload().topicSubscriptions()) {
+                if (isSharedSubscription(topicFilter.topicName())) {
+                    final String shareName = extractShareName(topicFilter.topicName());
+                    if (!validateShareName(shareName)) {
+                        // this is a malformed packet, MQTT-4.13.1-1, disconnect it
+                        LOG.info("{} used an invalid shared subscription name {}, disconnecting", clientID, shareName);
+                        session.disconnectFromBroker();
+                        return;
+                    }
+                }
+            }
+        }
         List<MqttTopicSubscription> ackTopics = authorizator.verifyTopicsReadAccess(clientID, username, msg);
         MqttSubAckMessage ackMessage = doAckMessageFromValidateFilters(ackTopics, messageID);
 
@@ -223,7 +308,6 @@ class PostOffice {
         }
 
         // add the subscriptions to Session
-        Session session = sessionRegistry.retrieve(clientID);
         session.addSubscriptions(newSubscriptions);
 
         // send ack message
@@ -236,11 +320,38 @@ class PostOffice {
         }
     }
 
+    /**
+     * @return the share name in the topic filter of format $share/{shareName}/{topicFilter}
+     * */
+    // VisibleForTesting
+    protected static String extractShareName(String sharedTopicFilter) {
+        int afterShare = "$share/".length();
+        int endOfShareName = sharedTopicFilter.indexOf('/', afterShare);
+        return sharedTopicFilter.substring(afterShare, endOfShareName);
+    }
+
+    /**
+     * @return true if shareName is well formed, is at least one characted and doesn't contain wildcard matchers
+     * */
+    private boolean validateShareName(String shareName) {
+        // MQTT-4.8.2-1 MQTT-4.8.2-2, must be longer than 1 char and do not contain + or #
+        Objects.requireNonNull(shareName);
+        return shareName.length() > 0 && !shareName.contains("+") && !shareName.contains("#");
+    }
+
+    /**
+     * @return true if topic filter is shared format
+     * */
+    private static boolean isSharedSubscription(String topicFilter) {
+        Objects.requireNonNull(topicFilter, "topicFilter can't be null");
+        return topicFilter.startsWith("$share/");
+    }
+
     private void publishRetainedMessagesForSubscriptions(String clientID, List<Subscription> newSubscriptions) {
         Session targetSession = this.sessionRegistry.retrieve(clientID);
         for (Subscription subscription : newSubscriptions) {
             final String topicFilter = subscription.getTopicFilter().toString();
-            final List<RetainedMessage> retainedMsgs = retainedRepository.retainedOnTopic(topicFilter);
+            final Collection<RetainedMessage> retainedMsgs = retainedRepository.retainedOnTopic(topicFilter);
 
             if (retainedMsgs.isEmpty()) {
                 // not found
@@ -469,7 +580,15 @@ class PostOffice {
                 collector.add(sub);
             }
         }
-        payload.retain(collector.countBatches());
+
+        int subscriptionCount = collector.countBatches();
+        if (subscriptionCount <= 0) {
+            // no matching subscriptions, clean exit
+            LOG.trace("No matching subscriptions for topic: {}", topic);
+            return new RoutingResults(Collections.emptyList(), Collections.emptyList(), CompletableFuture.completedFuture(null));
+        }
+
+        payload.retain(subscriptionCount);
 
         List<RouteResult> publishResults = collector.routeBatchedPublishes((batch) -> {
             publishToSession(payload, topic, batch, publishingQos);
@@ -630,6 +749,7 @@ class PostOffice {
     }
 
     public void terminate() {
+        willExpirationService.shutdown();
         sessionLoops.terminate();
     }
 

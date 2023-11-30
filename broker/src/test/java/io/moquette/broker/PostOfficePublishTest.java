@@ -107,8 +107,9 @@ public class PostOfficePublishTest {
         final PermitAllAuthorizatorPolicy authorizatorPolicy = new PermitAllAuthorizatorPolicy();
         final Authorizator permitAll = new Authorizator(authorizatorPolicy);
         final SessionEventLoopGroup loopsGroup = new SessionEventLoopGroup(ConnectionTestUtils.NO_OBSERVERS_INTERCEPTOR, 1024);
-        sessionRegistry = new SessionRegistry(subscriptions, memorySessionsRepository(), queueRepository, permitAll, scheduler, loopsGroup);
-        sut = new PostOffice(subscriptions, retainedRepository, sessionRegistry,
+        ISessionsRepository fakeSessionRepo = memorySessionsRepository();
+        sessionRegistry = new SessionRegistry(subscriptions, fakeSessionRepo, queueRepository, permitAll, scheduler, loopsGroup);
+        sut = new PostOffice(subscriptions, retainedRepository, sessionRegistry, fakeSessionRepo,
                              ConnectionTestUtils.NO_OBSERVERS_INTERCEPTOR, permitAll, loopsGroup);
     }
 
@@ -442,9 +443,9 @@ public class PostOfficePublishTest {
     }
 
     private void assertMessageIsRetained(String expectedTopicName, ByteBuf expectedPayload) {
-        List<RetainedMessage> msgs = retainedRepository.retainedOnTopic(expectedTopicName);
+        Collection<RetainedMessage> msgs = retainedRepository.retainedOnTopic(expectedTopicName);
         assertEquals(1, msgs.size());
-        RetainedMessage msg = msgs.get(0);
+        RetainedMessage msg = msgs.iterator().next();
         assertEquals(ByteBufUtil.hexDump(expectedPayload), ByteBufUtil.hexDump(msg.getPayload()));
     }
 }
