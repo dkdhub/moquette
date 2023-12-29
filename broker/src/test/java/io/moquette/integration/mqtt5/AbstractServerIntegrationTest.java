@@ -14,6 +14,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.Properties;
 
 public abstract class AbstractServerIntegrationTest {
@@ -50,10 +51,17 @@ public abstract class AbstractServerIntegrationTest {
 
     @AfterEach
     public void tearDown() throws Exception {
+        lowLevelClient.shutdownConnection();
         stopServer();
     }
 
     protected void stopServer() {
         broker.stopServer();
+    }
+
+    void restartServerWithSuspension(Duration timeout) throws InterruptedException, IOException {
+        stopServer();
+        Thread.sleep(timeout.toMillis());
+        startServer(dbPath);
     }
 }

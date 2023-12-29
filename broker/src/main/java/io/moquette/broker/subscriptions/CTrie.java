@@ -1,11 +1,122 @@
 package io.moquette.broker.subscriptions;
 
+import io.netty.handler.codec.mqtt.MqttQoS;
+
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 
 public class CTrie {
+
+    /**
+     * Models a request to subscribe a client, it's carrier for the Subscription
+     * */
+    public final static class SubscriptionRequest {
+
+        private final Topic topicFilter;
+        private final String clientId;
+        private final MqttQoS requestedQoS;
+
+        private boolean shared = false;
+        private ShareName shareName;
+
+        private SubscriptionRequest(String clientId, Topic topicFilter, MqttQoS requestedQoS) {
+            this.topicFilter = topicFilter;
+            this.clientId = clientId;
+            this.requestedQoS = requestedQoS;
+        }
+
+        public static SubscriptionRequest buildNonShared(Subscription subscription) {
+            return buildNonShared(subscription.clientId, subscription.topicFilter, subscription.getRequestedQos());
+        }
+
+        public static SubscriptionRequest buildNonShared(String clientId, Topic topicFilter, MqttQoS requestedQoS) {
+            return new SubscriptionRequest(clientId, topicFilter, requestedQoS);
+        }
+
+        public static SubscriptionRequest buildShared(ShareName shareName, Topic topicFilter, String clientId, MqttQoS requestedQoS) {
+            if (topicFilter.headToken().name().startsWith("$share")) {
+                throw new IllegalArgumentException("Topic filter of a shared subscription can't contains $share and share name");
+            }
+
+            SubscriptionRequest request = new SubscriptionRequest(clientId, topicFilter, requestedQoS);
+            request.shared = true;
+            request.shareName = shareName;
+            return request;
+        }
+
+        public Topic getTopicFilter() {
+            return topicFilter;
+        }
+
+        public Subscription subscription() {
+            return new Subscription(clientId, topicFilter, requestedQoS);
+        }
+
+        public SharedSubscription sharedSubscription() {
+            return new SharedSubscription(shareName, topicFilter, clientId, requestedQoS);
+        }
+
+        public boolean isShared() {
+            return shared;
+        }
+
+        public ShareName getSharedName() {
+            return shareName;
+        }
+
+        public String getClientId() {
+            return clientId;
+        }
+
+    }
+
+    /**
+     * Models a request to unsubscribe a client, it's carrier for the Subscription
+     * */
+    public final static class UnsubscribeRequest {
+        private final Topic topicFilter;
+        private final String clientId;
+        private boolean shared = false;
+        private ShareName shareName;
+
+        private UnsubscribeRequest(String clientId, Topic topicFilter) {
+            this.topicFilter = topicFilter;
+            this.clientId = clientId;
+        }
+
+        public static UnsubscribeRequest buildNonShared(String clientId, Topic topicFilter) {
+            return new UnsubscribeRequest(clientId, topicFilter);
+        }
+
+        public static UnsubscribeRequest buildShared(ShareName shareName, Topic topicFilter, String clientId) {
+            if (topicFilter.headToken().name().startsWith("$share")) {
+                throw new IllegalArgumentException("Topic filter of a shared subscription can't contains $share and share name");
+            }
+
+            UnsubscribeRequest request = new UnsubscribeRequest(clientId, topicFilter);
+            request.shared = true;
+            request.shareName = shareName;
+            return request;
+        }
+
+        public Topic getTopicFilter() {
+            return topicFilter;
+        }
+
+        public boolean isShared() {
+            return shared;
+        }
+
+        public ShareName getSharedName() {
+            return shareName;
+        }
+
+        public String getClientId() {
+            return clientId;
+        }
+    }
 
     interface IVisitor<T> {
 
@@ -88,7 +199,7 @@ public class CTrie {
         }
         NavigationAction action = evaluate(topicName, cnode, depth);
         if (action == NavigationAction.MATCH) {
-            return cnode.subscriptions;
+            return cnode.sharedAndNonSharedSubscriptions();
         }
         if (action == NavigationAction.STOP) {
             return Collections.emptyList();
@@ -107,7 +218,7 @@ public class CTrie {
             subscriptions.addAll(recursiveMatch(remainingTopic, subInode.get(), depth + 1));
         }
         if (remainingTopic.isEmpty()) {
-            subscriptions.addAll(cnode.subscriptions);
+            subscriptions.addAll(cnode.sharedAndNonSharedSubscriptions());
         } else {
             subInode = cnode.childOf(remainingTopic.headToken());
             if (subInode.isPresent()) {
@@ -117,31 +228,31 @@ public class CTrie {
         return subscriptions;
     }
 
-    public void addToTree(Subscription newSubscription) {
+    public void addToTree(SubscriptionRequest request) {
         Action res;
         do {
-            res = insert(newSubscription.topicFilter, this.root, newSubscription);
+            res = insert(request.getTopicFilter(), this.root, request);
         } while (res == Action.REPEAT);
     }
 
-    private Action insert(Topic topic, final INode inode, Subscription newSubscription) {
+    private Action insert(Topic topic, final INode inode, SubscriptionRequest request) {
         final Token token = topic.headToken();
         final CNode cnode = inode.mainNode();
         if (!topic.isEmpty()) {
             Optional<INode> nextInode = cnode.childOf(token);
             if (nextInode.isPresent()) {
                 Topic remainingTopic = topic.exceptHeadToken();
-                return insert(remainingTopic, nextInode.get(), newSubscription);
+                return insert(remainingTopic, nextInode.get(), request);
             }
         }
         if (topic.isEmpty()) {
-            return insertSubscription(inode, cnode, newSubscription);
+            return insertSubscription(inode, cnode, request);
         } else {
-            return createNodeAndInsertSubscription(topic, inode, cnode, newSubscription);
+            return createNodeAndInsertSubscription(topic, inode, cnode, request);
         }
     }
 
-    private Action insertSubscription(INode inode, CNode cnode, Subscription newSubscription) {
+    private Action insertSubscription(INode inode, CNode cnode, SubscriptionRequest newSubscription) {
         final CNode updatedCnode;
         if (cnode instanceof TNode) {
             updatedCnode = new CNode(cnode.getToken());
@@ -152,8 +263,8 @@ public class CTrie {
         return inode.compareAndSet(cnode, updatedCnode) ? Action.OK : Action.REPEAT;
     }
 
-    private Action createNodeAndInsertSubscription(Topic topic, INode inode, CNode cnode, Subscription newSubscription) {
-        final INode newInode = createPathRec(topic, newSubscription);
+    private Action createNodeAndInsertSubscription(Topic topic, INode inode, CNode cnode, SubscriptionRequest request) {
+        final INode newInode = createPathRec(topic, request);
         final CNode updatedCnode;
         if (cnode instanceof TNode) {
             updatedCnode = new CNode(cnode.getToken());
@@ -165,40 +276,40 @@ public class CTrie {
         return inode.compareAndSet(cnode, updatedCnode) ? Action.OK : Action.REPEAT;
     }
 
-    private INode createPathRec(Topic topic, Subscription newSubscription) {
+    private INode createPathRec(Topic topic, SubscriptionRequest request) {
         Topic remainingTopic = topic.exceptHeadToken();
         if (!remainingTopic.isEmpty()) {
-            INode inode = createPathRec(remainingTopic, newSubscription);
+            INode inode = createPathRec(remainingTopic, request);
             CNode cnode = new CNode(topic.headToken());
             cnode.add(inode);
             return new INode(cnode);
         } else {
-            return createLeafNodes(topic.headToken(), newSubscription);
+            return createLeafNodes(topic.headToken(), request);
         }
     }
 
-    private INode createLeafNodes(Token token, Subscription newSubscription) {
+    private INode createLeafNodes(Token token, SubscriptionRequest request) {
         CNode newLeafCnode = new CNode(token);
-        newLeafCnode.addSubscription(newSubscription);
+        newLeafCnode.addSubscription(request);
 
         return new INode(newLeafCnode);
     }
 
-    public void removeFromTree(Topic topic, String clientID) {
+    public void removeFromTree(UnsubscribeRequest request) {
         Action res;
         do {
-            res = remove(clientID, topic, this.root, NO_PARENT);
+            res = remove(request.getClientId(), request.getTopicFilter(), this.root, NO_PARENT, request);
         } while (res == Action.REPEAT);
     }
 
-    private Action remove(String clientId, Topic topic, INode inode, INode iParent) {
+    private Action remove(String clientId, Topic topic, INode inode, INode iParent, UnsubscribeRequest request) {
         Token token = topic.headToken();
         final CNode cnode = inode.mainNode();
         if (!topic.isEmpty()) {
             Optional<INode> nextInode = cnode.childOf(token);
             if (nextInode.isPresent()) {
                 Topic remainingTopic = topic.exceptHeadToken();
-                return remove(clientId, remainingTopic, nextInode.get(), inode);
+                return remove(clientId, remainingTopic, nextInode.get(), inode, request);
             }
         }
         if (cnode instanceof TNode) {
@@ -216,7 +327,7 @@ public class CTrie {
             return inode.compareAndSet(cnode, tnode) ? cleanTomb(inode, iParent) : Action.REPEAT;
         } else if (cnode.contains(clientId) && topic.isEmpty()) {
             CNode updatedCnode = cnode.copy();
-            updatedCnode.removeSubscriptionsFor(clientId);
+            updatedCnode.removeSubscriptionsFor(request);
             return inode.compareAndSet(cnode, updatedCnode) ? Action.OK : Action.REPEAT;
         } else {
             //someone else already removed
@@ -228,13 +339,11 @@ public class CTrie {
      *
      * Cleans Disposes of TNode in separate Atomic CAS operation per
      * http://bravenewgeek.com/breaking-and-entering-lose-the-lock-while-embracing-concurrency/
-     *
      * We roughly follow this theory above, but we allow CNode with no Subscriptions to linger (for now).
-     *
      *
      * @param inode inode that handle to the tomb node.
      * @param iParent inode parent.
-     * @return REPEAT if the this methods wasn't successful or OK.
+     * @return REPEAT if this method wasn't successful or OK.
      */
     private Action cleanTomb(INode inode, INode iParent) {
         CNode updatedCnode = iParent.mainNode().copy();

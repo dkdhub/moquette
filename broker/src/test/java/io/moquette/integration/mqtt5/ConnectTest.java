@@ -26,13 +26,13 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Optional;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -144,8 +144,8 @@ class ConnectTest extends AbstractServerIntegrationTest {
         verifyPublishedMessage(testamentSubscriber, 10, "Will message must be received");
     }
 
-    private static void verifyPublishedMessage(Mqtt5BlockingClient testamentSubscriber, int timeout, String message) throws InterruptedException {
-        try (Mqtt5BlockingClient.Mqtt5Publishes publishes = testamentSubscriber.publishes(MqttGlobalPublishFilter.ALL)) {
+    private static void verifyPublishedMessage(Mqtt5BlockingClient subscriber, int timeout, String message) throws InterruptedException {
+        try (Mqtt5BlockingClient.Mqtt5Publishes publishes = subscriber.publishes(MqttGlobalPublishFilter.ALL)) {
             Optional<Mqtt5Publish> publishMessage = publishes.receive(timeout, TimeUnit.SECONDS);
             final String payload = publishMessage.map(Mqtt5Publish::getPayloadAsBytes)
                 .map(b -> new String(b, StandardCharsets.UTF_8))
@@ -167,26 +167,32 @@ class ConnectTest extends AbstractServerIntegrationTest {
             .build();
         clientWithWill.disconnect(malformedPacketReason);
 
-        // reconnect another client with same clientId
-        final Mqtt5BlockingClient client = MqttClient.builder()
-            .useMqttVersion5()
-            .identifier(clientId)
-            .serverHost("localhost")
-            .serverPort(1883)
-            .buildBlocking();
-        Mqtt5ConnAck connectAck = client.connect();
-        assertEquals(Mqtt5ConnAckReasonCode.SUCCESS, connectAck.getReasonCode(), "Client connected");
-
         // wait no will is published
-        verifyNoTestamentIsPublished(testamentSubscriber, Duration.ofSeconds(10));
+        verifyNoTestamentIsPublished(testamentSubscriber, unused -> {
+            // reconnect another client with same clientId
+            final Mqtt5BlockingClient client = MqttClient.builder()
+                .useMqttVersion5()
+                .identifier(clientId)
+                .serverHost("localhost")
+                .serverPort(1883)
+                .buildBlocking();
+            Mqtt5ConnAck connectAck = client.connect();
+            assertEquals(Mqtt5ConnAckReasonCode.SUCCESS, connectAck.getReasonCode(), "Client connected");
+
+        }, Duration.ofSeconds(10));
     }
 
-    private static void verifyNoTestamentIsPublished(Mqtt5BlockingClient testamentSubscriber, Duration timeout) throws InterruptedException {
-        try (Mqtt5BlockingClient.Mqtt5Publishes publishes = testamentSubscriber.publishes(MqttGlobalPublishFilter.ALL)) {
-            Optional<Mqtt5Publish> publishedWill = publishes.receive(timeout.getSeconds(), TimeUnit.SECONDS);
+    private static void verifyNoTestamentIsPublished(Mqtt5BlockingClient testamentSubscriber, Consumer<Void> action, Duration timeout) throws InterruptedException {
+        verifyNoPublish(testamentSubscriber, action, timeout, "No will message should be published");
+    }
+
+    protected static void verifyNoPublish(Mqtt5BlockingClient subscriber, Consumer<Void> action, Duration timeout, String message) throws InterruptedException {
+        try (Mqtt5BlockingClient.Mqtt5Publishes publishes = subscriber.publishes(MqttGlobalPublishFilter.ALL)) {
+            action.accept(null);
+            Optional<Mqtt5Publish> publishedMessage = publishes.receive(timeout.getSeconds(), TimeUnit.SECONDS);
 
             // verify no published will in 10 seconds
-            assertFalse(publishedWill.isPresent(), "No will message should be published");
+            assertFalse(publishedMessage.isPresent(), message);
         }
     }
 
@@ -215,11 +221,11 @@ class ConnectTest extends AbstractServerIntegrationTest {
 
         final Mqtt5BlockingClient testamentSubscriber = createAndConnectClientListeningToTestament();
 
-        // normal session disconnection
-        clientWithWill.disconnect(Mqtt5Disconnect.builder().build());
-
         // wait no will is published
-        verifyNoTestamentIsPublished(testamentSubscriber, Duration.ofSeconds(10));
+        verifyNoTestamentIsPublished(testamentSubscriber, unused -> {
+            // normal session disconnection
+            clientWithWill.disconnect(Mqtt5Disconnect.builder().build());
+        }, Duration.ofSeconds(10));
     }
 
     @Test
@@ -230,13 +236,13 @@ class ConnectTest extends AbstractServerIntegrationTest {
 
         final Mqtt5BlockingClient testamentSubscriber = createAndConnectClientListeningToTestament();
 
-        // normal session disconnection with will
-        clientWithWill.disconnect(Mqtt5Disconnect.builder()
-            .reasonCode(Mqtt5DisconnectReasonCode.DISCONNECT_WITH_WILL_MESSAGE)
-            .build());
-
         // wait no will is published
-        verifyNoTestamentIsPublished(testamentSubscriber, Duration.ofSeconds(10));
+        verifyNoTestamentIsPublished(testamentSubscriber, unused -> {
+            // normal session disconnection with will
+            clientWithWill.disconnect(Mqtt5Disconnect.builder()
+                .reasonCode(Mqtt5DisconnectReasonCode.DISCONNECT_WITH_WILL_MESSAGE)
+                .build());
+        }, Duration.ofSeconds(10));
     }
 
     @Test
@@ -255,12 +261,6 @@ class ConnectTest extends AbstractServerIntegrationTest {
         final Mqtt5BlockingClient testamentSubscriber = createAndConnectClientListeningToTestament();
 
         verifyPublishedMessage(testamentSubscriber, 10, "Will message must be received after server restart");
-    }
-
-    private void restartServerWithSuspension(Duration timeout) throws InterruptedException, IOException {
-        stopServer();
-        Thread.sleep(timeout.toMillis());
-        startServer(dbPath);
     }
 
     private void scheduleDisconnectWithErrorCode(Mqtt5BlockingClient clientWithWill, Duration delay) {

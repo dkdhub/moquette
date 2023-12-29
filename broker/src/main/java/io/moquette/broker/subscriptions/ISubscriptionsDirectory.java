@@ -16,6 +16,7 @@
 package io.moquette.broker.subscriptions;
 
 import io.moquette.broker.ISubscriptionsRepository;
+import io.netty.handler.codec.mqtt.MqttQoS;
 
 import java.util.List;
 import java.util.Set;
@@ -27,17 +28,33 @@ public interface ISubscriptionsDirectory {
 
     void init(ISubscriptionsRepository sessionsRepository);
 
-    Set<String> listAllSessionIds();
-
     List<Subscription> matchWithoutQosSharpening(Topic topic);
 
     List<Subscription> matchQosSharpening(Topic topic);
 
-    void add(Subscription newSubscription);
+    void add(String clientId, Topic filter, MqttQoS requestedQoS);
+
+    void addShared(String clientId, ShareName name, Topic topicFilter, MqttQoS requestedQoS);
 
     void removeSubscription(Topic topic, String clientID);
+
+    /**
+     * Removes shared subscription.
+     *
+     * @param name part of the shared subscription.
+     * @param topicFilter topic filter part.
+     * @param clientId the client session to unsubscribe.
+     * */
+    void removeSharedSubscription(ShareName name, Topic topicFilter, String clientId);
 
     int size();
 
     String dumpTree();
+
+    /**
+     * Removes all the shared subscriptions for the given session.
+     *
+     * @param clientId The session identifier.
+     * */
+    void removeSharedSubscriptionsForClient(String clientId);
 }
