@@ -28,14 +28,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.net.InetSocketAddress;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.Set;
+import java.time.Instant;
+import java.util.*;
 import java.util.concurrent.DelayQueue;
 import java.util.concurrent.Delayed;
 import java.util.concurrent.TimeUnit;
@@ -157,7 +151,7 @@ class Session {
     }
 
     public void removeSubscription(Topic topic) {
-        subscriptions.remove(new Subscription(data.clientId(), topic, MqttQoS.EXACTLY_ONCE));
+        subscriptions.remove(new Subscription(data.clientId(), topic, MqttSubscriptionOption.onlyFromQos(MqttQoS.EXACTLY_ONCE)));
     }
 
     public boolean hasWill() {
@@ -198,6 +192,7 @@ class Session {
 
     public void processPubRec(int pubRecPacketId) {
         // Message discarded, make sure any buffers in it are released
+        cleanFromInflight(pubRecPacketId);
         SessionRegistry.EnqueuedMessage removed = inflightWindow.remove(pubRecPacketId);
         if (removed == null) {
             LOG.warn("Received a PUBREC with not matching packetId");
@@ -224,6 +219,7 @@ class Session {
 
     public void processPubComp(int messageID) {
         // Message discarded, make sure any buffers in it are released
+        cleanFromInflight(messageID);
         SessionRegistry.EnqueuedMessage removed = inflightWindow.remove(messageID);
         if (removed == null) {
             LOG.warn("Received a PUBCOMP with not matching packetId");
@@ -239,82 +235,78 @@ class Session {
 //                m_interceptor.notifyMessageAcknowledged(interceptAckMsg);
     }
 
-    public void sendRetainedPublishOnSessionAtQos(Topic topic, MqttQoS qos, ByteBuf payload) {
-        sendPublishOnSessionAtQos(topic, qos, payload, true);
+    public void sendRetainedPublishOnSessionAtQos(Topic topic, MqttQoS qos, ByteBuf payload,
+                                                  MqttProperties.MqttProperty... mqttProperties) {
+        final PublishedMessage publishedMessage = new PublishedMessage(topic, qos, payload, true, Instant.MAX, mqttProperties);
+        sendPublishOnSessionAtQos(publishedMessage);
     }
 
-    public void sendNotRetainedPublishOnSessionAtQos(Topic topic, MqttQoS qos, ByteBuf payload) {
-        sendPublishOnSessionAtQos(topic, qos, payload, false);
-    }
-
-    private void sendPublishOnSessionAtQos(Topic topic, MqttQoS qos, ByteBuf payload, boolean retained) {
-        switch (qos) {
+    void sendPublishOnSessionAtQos(PublishedMessage publishRequest) {
+        switch (publishRequest.getPublishingQos()) {
             case AT_MOST_ONCE:
                 if (connected()) {
-                    mqttConnection.sendPublishQos0(topic, qos, payload, retained);
+                    sendPublishQos0(publishRequest);
                 }
                 break;
             case AT_LEAST_ONCE:
-                sendPublishQos1(topic, qos, payload, retained);
+                sendPublishQos1(publishRequest);
                 break;
             case EXACTLY_ONCE:
-                sendPublishQos2(topic, qos, payload, retained);
+                sendPublishQos2(publishRequest);
                 break;
             case FAILURE:
                 LOG.error("Not admissible");
         }
     }
 
-    private void sendPublishQos1(Topic topic, MqttQoS qos, ByteBuf payload, boolean retained) {
+    private void sendPublishQos0(PublishedMessage publishRequest) {
+        if (publishRequest.isExpired()) {
+            LOG.debug("Sending publish at QoS0 already expired, drop it");
+            return;
+        }
+
+        MqttProperties.MqttProperty[] mqttProperties = publishRequest.updatePublicationExpiryIfPresentOrAdd();
+        MqttPublishMessage publishMsg = MQTTConnection.createPublishMessage(publishRequest.getTopic().toString(),
+            publishRequest.getPublishingQos(), publishRequest.getPayload(), 0,
+            publishRequest.retained, false, mqttProperties);
+        mqttConnection.sendPublish(publishMsg);
+    }
+
+    private void sendPublishQos1(PublishedMessage publishRequest) {
         if (!connected() && isClean()) {
             //pushing messages to disconnected not clean session
             return;
         }
+        if (publishRequest.isExpired()) {
+            LOG.debug("Sending publish at QoS1 already expired, expected to happen before {}, drop it", publishRequest.messageExpiry);
+            return;
+        }
 
         final MQTTConnection localMqttConnectionRef = mqttConnection;
-        if (canSkipQueue(localMqttConnectionRef)) {
-            inflightSlots.decrementAndGet();
-            int packetId = localMqttConnectionRef.nextPacketId();
-
-            // Adding to a map, retain.
-            payload.retain();
-            EnqueuedMessage old = inflightWindow.put(packetId, new PublishedMessage(topic, qos, payload, retained));
-            // If there already was something, release it.
-            if (old != null) {
-                old.release();
-                inflightSlots.incrementAndGet();
-            }
-            if (resendInflightOnTimeout) {
-                inflightTimeouts.add(new InFlightPacket(packetId, FLIGHT_BEFORE_RESEND_MS));
-            }
-
-            MqttPublishMessage publishMsg = MQTTConnection.createNotRetainedPublishMessage(topic.toString(), qos,
-                                                                                           payload, packetId);
-            localMqttConnectionRef.sendPublish(publishMsg);
-            LOG.debug("Write direct to the peer, inflight slots: {}", inflightSlots.get());
-            if (inflightSlots.get() == 0) {
-                localMqttConnectionRef.flush();
-            }
-
-            // TODO drainQueueToConnection();?
-        } else {
-            final SessionRegistry.PublishedMessage msg = new SessionRegistry.PublishedMessage(topic, qos, payload, retained);
-            // Adding to a queue, retain.
-            msg.retain();
-            sessionQueue.enqueue(msg);
-            LOG.debug("Enqueue to peer session");
-        }
+        sendPublishInFlightWindowOrQueueing(localMqttConnectionRef, publishRequest);
     }
 
-    private void sendPublishQos2(Topic topic, MqttQoS qos, ByteBuf payload, boolean retained) {
+    private void sendPublishQos2(PublishedMessage publishRequest) {
+        if (publishRequest.isExpired()) {
+            LOG.debug("Sending publish at QoS2 already expired, drop it");
+            return;
+        }
         final MQTTConnection localMqttConnectionRef = mqttConnection;
+        sendPublishInFlightWindowOrQueueing(localMqttConnectionRef, publishRequest);
+    }
+
+    private void sendPublishInFlightWindowOrQueueing(MQTTConnection localMqttConnectionRef,
+                                                     PublishedMessage publishRequest) {
+        // retain the payload because it's going to be added to map or to the queue.
+        publishRequest.retain();
+
         if (canSkipQueue(localMqttConnectionRef)) {
             inflightSlots.decrementAndGet();
             int packetId = localMqttConnectionRef.nextPacketId();
 
-            // Retain before adding to map
-            payload.retain();
-            EnqueuedMessage old = inflightWindow.put(packetId, new SessionRegistry.PublishedMessage(topic, qos, payload, retained));
+            LOG.debug("Adding into inflight for session {} at QoS {}", getClientID(), publishRequest.getPublishingQos());
+
+            EnqueuedMessage old = inflightWindow.put(packetId, publishRequest);
             // If there already was something, release it.
             if (old != null) {
                 old.release();
@@ -323,16 +315,17 @@ class Session {
             if (resendInflightOnTimeout) {
                 inflightTimeouts.add(new InFlightPacket(packetId, FLIGHT_BEFORE_RESEND_MS));
             }
-            MqttPublishMessage publishMsg = MQTTConnection.createNotRetainedPublishMessage(topic.toString(), qos,
-                                                                                           payload, packetId);
+
+            MqttProperties.MqttProperty[] mqttProperties = publishRequest.updatePublicationExpiryIfPresentOrAdd();
+            MqttPublishMessage publishMsg = MQTTConnection.createPublishMessage(
+                publishRequest.topic.toString(), publishRequest.getPublishingQos(),
+                publishRequest.payload, packetId, publishRequest.retained, false, mqttProperties);
             localMqttConnectionRef.sendPublish(publishMsg);
 
             drainQueueToConnection();
         } else {
-            final SessionRegistry.PublishedMessage msg = new SessionRegistry.PublishedMessage(topic, qos, payload, retained);
-            // Adding to a queue, retain.
-            msg.retain();
-            sessionQueue.enqueue(msg);
+            sessionQueue.enqueue(publishRequest);
+            LOG.debug("Enqueue to peer session {} at QoS {}", getClientID(), publishRequest.getPublishingQos());
         }
     }
 
@@ -352,6 +345,7 @@ class Session {
 
     void pubAckReceived(int ackPacketId) {
         // TODO remain to invoke in somehow m_interceptor.notifyMessageAcknowledged
+        cleanFromInflight(ackPacketId);
         SessionRegistry.EnqueuedMessage removed = inflightWindow.remove(ackPacketId);
         if (removed == null) {
             LOG.warn("Received a PUBACK with not matching packetId");
@@ -360,7 +354,12 @@ class Session {
         removed.release();
 
         inflightSlots.incrementAndGet();
+        LOG.debug("Received PUBACK {} for session {}", ackPacketId, getClientID());
         drainQueueToConnection();
+    }
+
+    private void cleanFromInflight(int ackPacketId) {
+        inflightTimeouts.removeIf(d -> d.packetId == ackPacketId);
     }
 
     public void flushAllQueuedMessages() {
@@ -398,8 +397,10 @@ class Session {
                 final Topic topic = pubMsg.topic;
                 final MqttQoS qos = pubMsg.publishingQos;
                 final ByteBuf payload = pubMsg.payload;
+                final MqttProperties.MqttProperty<?>[] mqttProperties = pubMsg.mqttProperties;
                 // message fetched from map, but not removed from map. No need to duplicate or release.
-                MqttPublishMessage publishMsg = publishNotRetainedDuplicated(notAckPacketId, topic, qos, payload);
+                MqttPublishMessage publishMsg = MQTTConnection.createNotRetainedDuplicatedPublishMessage(
+                    notAckPacketId, topic, qos, payload, mqttProperties);
                 if (resendInflightOnTimeout) {
                     inflightTimeouts.add(new InFlightPacket(notAckPacketId, FLIGHT_BEFORE_RESEND_MS));
                 }
@@ -420,13 +421,6 @@ class Session {
         LOG.debug("Resending {} in flight packets [{}]", packetIds.size(), sb);
     }
 
-    private MqttPublishMessage publishNotRetainedDuplicated(int packetId, Topic topic, MqttQoS qos,
-                                                            ByteBuf payload) {
-        MqttFixedHeader fixedHeader = new MqttFixedHeader(MqttMessageType.PUBLISH, true, qos, false, 0);
-        MqttPublishVariableHeader varHeader = new MqttPublishVariableHeader(topic.toString(), packetId);
-        return new MqttPublishMessage(fixedHeader, varHeader, payload);
-    }
-
     private void drainQueueToConnection() {
         // consume the queue
         while (connected() && !sessionQueue.isEmpty() && inflightHasSlotsAndConnectionIsUp()) {
@@ -435,6 +429,12 @@ class Session {
                 // Our message was already fetched by another Thread.
                 return;
             }
+            final SessionRegistry.PublishedMessage msgPub = (SessionRegistry.PublishedMessage) msg;
+            if (msgPub.isExpired()) {
+                LOG.debug("Drop an expired message contained in the queue");
+                return;
+            }
+
             inflightSlots.decrementAndGet();
             int sendPacketId = mqttConnection.nextPacketId();
 
@@ -447,11 +447,15 @@ class Session {
             if (resendInflightOnTimeout) {
                 inflightTimeouts.add(new InFlightPacket(sendPacketId, FLIGHT_BEFORE_RESEND_MS));
             }
-            final SessionRegistry.PublishedMessage msgPub = (SessionRegistry.PublishedMessage) msg;
+
+            MqttProperties.MqttProperty[] mqttProperties = msgPub.updatePublicationExpiryIfPresentOrAdd();
+
             MqttPublishMessage publishMsg = MQTTConnection.createNotRetainedPublishMessage(
                 msgPub.topic.toString(),
                 msgPub.publishingQos,
-                msgPub.payload, sendPacketId);
+                msgPub.payload,
+                sendPacketId,
+                mqttProperties);
             mqttConnection.sendPublish(publishMsg);
 
             // we fetched msg from a map, but the release is cancelled out by the above retain
@@ -498,6 +502,7 @@ class Session {
         // in case of in memory session queues all contained messages
         // has to be released.
         sessionQueue.closeAndPurge();
+        inflightTimeouts.clear();
         for (EnqueuedMessage msg : inflightWindow.values()) {
             msg.release();
         }

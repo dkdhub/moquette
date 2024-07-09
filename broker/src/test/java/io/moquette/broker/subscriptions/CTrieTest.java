@@ -18,6 +18,7 @@ package io.moquette.broker.subscriptions;
 
 import io.moquette.broker.subscriptions.CTrie.SubscriptionRequest;
 import io.netty.handler.codec.mqtt.MqttQoS;
+import io.netty.handler.codec.mqtt.MqttSubscriptionOption;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -89,11 +90,11 @@ public class CTrieTest {
     @Test
     public void testAddNewSubscriptionOnExistingNode() {
         final SubscriptionRequest existingSubscription = clientSubOnTopic("TempSensor1", "/temp");
-        sut.addToTree(existingSubscription);
+        assertTrue(sut.addToTree(existingSubscription), "First created subscription on topic filter MUST return true");
 
         //Exercise
         final SubscriptionRequest newSubscription = clientSubOnTopic("TempSensor2", "/temp");
-        sut.addToTree(newSubscription);
+        assertFalse(sut.addToTree(newSubscription), "Not new created subscription on topic filter MUST return false");
 
         //Verify
         final Optional<CNode> matchedNode = sut.lookup(asTopic("/temp"));
@@ -121,7 +122,7 @@ public class CTrieTest {
     }
 
     static SubscriptionRequest clientSubOnTopic(String clientID, String topicFilter) {
-        return SubscriptionRequest.buildNonShared(clientID, asTopic(topicFilter), null);
+        return SubscriptionRequest.buildNonShared(clientID, asTopic(topicFilter), MqttSubscriptionOption.onlyFromQos(null));
     }
 
     @Test
@@ -193,7 +194,7 @@ public class CTrieTest {
         final List<Subscription> matchingSubs = sut.recursiveMatch(asTopic("/temp/2"));
 
         //Verify
-        final Subscription expectedMatchingsub = new Subscription("TempSensor1", asTopic("/temp/2"), MqttQoS.AT_MOST_ONCE);
+        final Subscription expectedMatchingsub = new Subscription("TempSensor1", asTopic("/temp/2"), MqttSubscriptionOption.onlyFromQos(MqttQoS.AT_MOST_ONCE));
         assertThat(matchingSubs).contains(expectedMatchingsub);
     }
 
@@ -212,9 +213,9 @@ public class CTrieTest {
 
         //Verify
         // not clear to me, but I believe /temp unsubscribe should not unsub you from downstream /temp/1 or /temp/2
-        final Subscription expectedMatchingsub1 = new Subscription("TempSensor1", asTopic("/temp/1"), MqttQoS.AT_MOST_ONCE);
+        final Subscription expectedMatchingsub1 = new Subscription("TempSensor1", asTopic("/temp/1"), MqttSubscriptionOption.onlyFromQos(MqttQoS.AT_MOST_ONCE));
         assertThat(matchingSubs1).contains(expectedMatchingsub1);
-        final Subscription expectedMatchingsub2 = new Subscription("TempSensor1", asTopic("/temp/2"), MqttQoS.AT_MOST_ONCE);
+        final Subscription expectedMatchingsub2 = new Subscription("TempSensor1", asTopic("/temp/2"), MqttSubscriptionOption.onlyFromQos(MqttQoS.AT_MOST_ONCE));
         assertThat(matchingSubs2).contains(expectedMatchingsub2);
     }
 
@@ -239,7 +240,7 @@ public class CTrieTest {
         final List<Subscription> matchingSubs = sut.recursiveMatch(asTopic("/temp"));
 
         //Verify
-        final Subscription expectedMatchingsub = new Subscription("TempSensor1", asTopic("/temp"), MqttQoS.AT_MOST_ONCE);
+        final Subscription expectedMatchingsub = new Subscription("TempSensor1", asTopic("/temp"), MqttSubscriptionOption.onlyFromQos(MqttQoS.AT_MOST_ONCE));
         assertThat(matchingSubs).contains(expectedMatchingsub);
     }
 
@@ -255,8 +256,8 @@ public class CTrieTest {
         final List<Subscription> matchingSubs2 = sut.recursiveMatch(asTopic("temp/1"));
 
         //Verify
-        final Subscription expectedMatchingsub1 = new Subscription("TempSensor1", asTopic("temp"), MqttQoS.AT_MOST_ONCE);
-        final Subscription expectedMatchingsub2 = new Subscription("TempSensor1", asTopic("temp/1"), MqttQoS.AT_MOST_ONCE);
+        final Subscription expectedMatchingsub1 = new Subscription("TempSensor1", asTopic("temp"), MqttSubscriptionOption.onlyFromQos(MqttQoS.AT_MOST_ONCE));
+        final Subscription expectedMatchingsub2 = new Subscription("TempSensor1", asTopic("temp/1"), MqttSubscriptionOption.onlyFromQos(MqttQoS.AT_MOST_ONCE));
 
         assertThat(matchingSubs1).contains(expectedMatchingsub1);
         assertThat(matchingSubs2).contains(expectedMatchingsub2);
@@ -283,8 +284,8 @@ public class CTrieTest {
         final List<Subscription> matchingSubs2 = sut.recursiveMatch(asTopic("temp/1"));
 
         //Verify
-        final Subscription expectedMatchingsub1 = new Subscription("TempSensor1", asTopic("temp"), MqttQoS.AT_MOST_ONCE);
-        final Subscription expectedMatchingsub2 = new Subscription("TempSensor2", asTopic("temp/1"), MqttQoS.AT_MOST_ONCE);
+        final Subscription expectedMatchingsub1 = new Subscription("TempSensor1", asTopic("temp"), MqttSubscriptionOption.onlyFromQos(MqttQoS.AT_MOST_ONCE));
+        final Subscription expectedMatchingsub2 = new Subscription("TempSensor2", asTopic("temp/1"), MqttSubscriptionOption.onlyFromQos(MqttQoS.AT_MOST_ONCE));
 
         assertThat(matchingSubs1).contains(expectedMatchingsub1);
         assertThat(matchingSubs2).contains(expectedMatchingsub2);
@@ -311,8 +312,8 @@ public class CTrieTest {
         final List<Subscription> matchingSubs2 = sut.recursiveMatch(asTopic("temp/1"));
 
         //Verify
-        final Subscription expectedMatchingsub1 = new Subscription("TempSensor1", asTopic("temp"), MqttQoS.AT_MOST_ONCE);
-        final Subscription expectedMatchingsub2 = new Subscription("TempSensor2", asTopic("temp/1"), MqttQoS.AT_MOST_ONCE);
+        final Subscription expectedMatchingsub1 = new Subscription("TempSensor1", asTopic("temp"), MqttSubscriptionOption.onlyFromQos(MqttQoS.AT_MOST_ONCE));
+        final Subscription expectedMatchingsub2 = new Subscription("TempSensor2", asTopic("temp/1"), MqttSubscriptionOption.onlyFromQos(MqttQoS.AT_MOST_ONCE));
 
         assertThat(matchingSubs1).contains(expectedMatchingsub1);
         assertThat(matchingSubs2).contains(expectedMatchingsub2);

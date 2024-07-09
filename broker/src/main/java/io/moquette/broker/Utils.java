@@ -13,7 +13,6 @@
  *
  * You may elect to redistribute this code under either of these licenses.
  */
-
 package io.moquette.broker;
 
 import io.netty.buffer.ByteBuf;
@@ -23,6 +22,7 @@ import io.netty.handler.codec.mqtt.MqttMessageIdVariableHeader;
 import io.netty.handler.codec.mqtt.MqttVersion;
 
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * Utility static methods, like Map get with default value, or elvis operator.
@@ -43,9 +43,7 @@ public final class Utils {
 
     public static byte[] readBytesAndRewind(ByteBuf payload) {
         byte[] payloadContent = new byte[payload.readableBytes()];
-        int mark = payload.readerIndex();
-        payload.readBytes(payloadContent);
-        payload.readerIndex(mark);
+        payload.getBytes(payload.readerIndex(), payloadContent, 0, payload.readableBytes());
         return payloadContent;
     }
 
@@ -54,5 +52,32 @@ public final class Utils {
     }
 
     private Utils() {
+    }
+
+    public static final class Couple<K, L> {
+        public final K v1;
+        public final L v2;
+
+        public Couple(K v1, L v2) {
+            this.v1 = v1;
+            this.v2 = v2;
+        }
+
+        public static <K, L> Couple<K, L> of(K v1, L v2) {
+            return new Couple<>(v1, v2);
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            Couple<?, ?> couple = (Couple<?, ?>) o;
+            return Objects.equals(v1, couple.v1) && Objects.equals(v2, couple.v2);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(v1, v2);
+        }
     }
 }

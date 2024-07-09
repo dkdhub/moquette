@@ -17,45 +17,56 @@
 package io.moquette.broker.subscriptions;
 
 import io.netty.handler.codec.mqtt.MqttQoS;
+import io.netty.handler.codec.mqtt.MqttSubscriptionOption;
 
 import java.io.Serializable;
 import java.util.Objects;
+import java.util.Optional;
 
 /**
  * Maintain the information about which Topic a certain ClientID is subscribed and at which QoS
  */
-public final class Subscription implements Serializable, Comparable<Subscription> {
+public final class Subscription implements Serializable, Comparable<Subscription>{
 
     private static final long serialVersionUID = -3383457629635732794L;
-    private final MqttQoS requestedQos; // max QoS acceptable
+    private final MqttSubscriptionOption option;
     final String clientId;
     final Topic topicFilter;
     final String shareName;
 
-    public Subscription(String clientId, Topic topicFilter, MqttQoS requestedQos) {
-        this(clientId, topicFilter, requestedQos, "");
+    private final Optional<SubscriptionIdentifier> subscriptionId;
+
+    public Subscription(String clientId, Topic topicFilter, MqttSubscriptionOption options) {
+        this(clientId, topicFilter, options, "");
     }
 
-    public Subscription(String clientId, Topic topicFilter, MqttQoS requestedQos, String shareName) {
-        this.requestedQos = requestedQos;
+    public Subscription(String clientId, Topic topicFilter, MqttSubscriptionOption options, SubscriptionIdentifier subscriptionId) {
+        this(clientId, topicFilter, options, "", subscriptionId);
+    }
+
+    public Subscription(String clientId, Topic topicFilter, MqttSubscriptionOption options, String shareName) {
+        this(clientId, topicFilter, options, shareName, null);
+    }
+
+    public Subscription(String clientId, Topic topicFilter, MqttSubscriptionOption options, String shareName,
+                        SubscriptionIdentifier subscriptionId) {
         this.clientId = clientId;
         this.topicFilter = topicFilter;
         this.shareName = shareName;
+        this.subscriptionId = Optional.ofNullable(subscriptionId);
+        this.option = options;
     }
 
     public Subscription(Subscription orig) {
-        this.requestedQos = orig.requestedQos;
         this.clientId = orig.clientId;
         this.topicFilter = orig.topicFilter;
         this.shareName = orig.shareName;
+        this.subscriptionId = orig.subscriptionId;
+        this.option = orig.option;
     }
 
     public String getClientId() {
         return clientId;
-    }
-
-    public MqttQoS getRequestedQos() {
-        return requestedQos;
     }
 
     public Topic getTopicFilter() {
@@ -63,7 +74,15 @@ public final class Subscription implements Serializable, Comparable<Subscription
     }
 
     public boolean qosLessThan(Subscription sub) {
-        return requestedQos.value() < sub.requestedQos.value();
+        return option.qos().value() < sub.option.qos().value();
+    }
+
+    public boolean hasSubscriptionIdentifier() {
+        return subscriptionId.isPresent();
+    }
+
+    public SubscriptionIdentifier getSubscriptionIdentifier() {
+        return subscriptionId.get();
     }
 
     @Override
@@ -83,7 +102,7 @@ public final class Subscription implements Serializable, Comparable<Subscription
 
     @Override
     public String toString() {
-        return String.format("[filter:%s, clientID: %s, qos: %s - shareName: %s]", topicFilter, clientId, requestedQos, shareName);
+        return String.format("[filter:%s, clientID: %s, options: %s - shareName: %s]", topicFilter, clientId, option, shareName);
     }
 
     @Override
@@ -111,5 +130,17 @@ public final class Subscription implements Serializable, Comparable<Subscription
 
     public String clientAndShareName() {
         return clientId + (shareName.isEmpty() ? "" : "-" + shareName);
+    }
+
+    public boolean hasShareName() {
+        return shareName != null;
+    }
+
+    public String getShareName() {
+        return shareName;
+    }
+
+    public MqttSubscriptionOption option() {
+        return option;
     }
 }

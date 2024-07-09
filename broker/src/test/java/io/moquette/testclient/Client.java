@@ -13,7 +13,6 @@
  *
  * You may elect to redistribute this code under either of these licenses.
  */
-
 package io.moquette.testclient;
 
 import io.moquette.BrokerConstants;
@@ -30,7 +29,6 @@ import org.slf4j.LoggerFactory;
 import java.nio.charset.Charset;
 import java.time.Duration;
 import java.util.Optional;
-import java.util.Queue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -52,6 +50,9 @@ public class Client {
     }
 
     private static final Logger LOG = LoggerFactory.getLogger(Client.class);
+
+    private static final Duration TIMEOUT_DURATION = Duration.ofMillis(300);
+
     final ClientNettyMQTTHandler handler = new ClientNettyMQTTHandler();
     EventLoopGroup workerGroup;
     Channel m_channel;
@@ -79,9 +80,9 @@ public class Client {
                 @Override
                 public void initChannel(SocketChannel ch) throws Exception {
                     ChannelPipeline pipeline = ch.pipeline();
-                    pipeline.addLast("decoder", new MqttDecoder());
-                    pipeline.addLast("encoder", MqttEncoder.INSTANCE);
-                    pipeline.addLast("handler", handler);
+                    pipeline.addLast("rawcli_decoder", new MqttDecoder());
+                    pipeline.addLast("rawcli_encoder", MqttEncoder.INSTANCE);
+                    pipeline.addLast("rawcli_handler", handler);
                 }
             });
 
@@ -138,12 +139,17 @@ public class Client {
     }
 
     public MqttConnAckMessage connectV5() {
+        return connectV5(2);
+    }
+
+    @NotNull
+    public MqttConnAckMessage connectV5(int keepAliveSecs) {
         final MqttMessageBuilders.ConnectBuilder builder = MqttMessageBuilders.connect().protocolVersion(MqttVersion.MQTT_5);
         if (clientId != null) {
             builder.clientId(clientId);
         }
         MqttConnectMessage connectMessage = builder
-            .keepAlive(2) // secs
+            .keepAlive(keepAliveSecs) // secs
             .willFlag(false)
             .willQoS(MqttQoS.AT_MOST_ONCE)
             .build();
@@ -190,7 +196,7 @@ public class Client {
             .addSubscription(qos2, topic2)
             .build();
 
-        return doSubscribeWithAckCasting(subscribeMessage);
+        return doSubscribeWithAckCasting(subscribeMessage, TIMEOUT_DURATION.toMillis(), TimeUnit.MILLISECONDS);
     }
 
     public MqttSubAckMessage subscribe(String topic, MqttQoS qos) {
@@ -199,12 +205,33 @@ public class Client {
             .addSubscription(qos, topic)
             .build();
 
-        return doSubscribeWithAckCasting(subscribeMessage);
+        return doSubscribeWithAckCasting(subscribeMessage, TIMEOUT_DURATION.toMillis(), TimeUnit.MILLISECONDS);
+    }
+
+    public MqttSubAckMessage subscribeWithIdentifier(String topic, MqttQoS qos, int subscriptionIdentifier) {
+        return subscribeWithIdentifier(topic, qos, subscriptionIdentifier, TIMEOUT_DURATION.toMillis(), TimeUnit.MILLISECONDS);
     }
 
     @NotNull
-    private MqttSubAckMessage doSubscribeWithAckCasting(MqttSubscribeMessage subscribeMessage) {
-        doSubscribe(subscribeMessage);
+    public MqttSubAckMessage subscribeWithIdentifier(String topic, MqttQoS qos, int subscriptionIdentifier,
+                                                      long timeout, TimeUnit timeUnit) {
+        MqttProperties subProps = new MqttProperties();
+        subProps.add(new MqttProperties.IntegerProperty(
+            MqttProperties.MqttPropertyType.SUBSCRIPTION_IDENTIFIER.value(),
+            subscriptionIdentifier));
+
+        final MqttSubscribeMessage subscribeMessage = MqttMessageBuilders.subscribe()
+            .messageId(1)
+            .addSubscription(qos, topic)
+            .properties(subProps)
+            .build();
+
+        return doSubscribeWithAckCasting(subscribeMessage, timeout, timeUnit);
+    }
+
+    @NotNull
+    private MqttSubAckMessage doSubscribeWithAckCasting(MqttSubscribeMessage subscribeMessage, long timeout, TimeUnit timeUnit) {
+        doSubscribe(subscribeMessage, timeout, timeUnit);
 
         final MqttMessage subAckMessage = this.receivedMsg.get();
         if (!(subAckMessage instanceof MqttSubAckMessage)) {
@@ -214,7 +241,7 @@ public class Client {
         return (MqttSubAckMessage) subAckMessage;
     }
 
-    private void doSubscribe(MqttSubscribeMessage subscribeMessage) {
+    private void doSubscribe(MqttSubscribeMessage subscribeMessage, long timeout, TimeUnit timeUnit) {
         final CountDownLatch subscribeAckLatch = new CountDownLatch(1);
         this.setCallback(msg -> {
             receivedMsg.getAndSet(msg);
@@ -231,13 +258,40 @@ public class Client {
 
         boolean waitElapsed;
         try {
-            waitElapsed = !subscribeAckLatch.await(200, TimeUnit.MILLISECONDS);
+            waitElapsed = !subscribeAckLatch.await(timeout, timeUnit);
         } catch (InterruptedException e) {
             throw new RuntimeException("Interrupted while waiting", e);
         }
 
         if (waitElapsed) {
-            throw new RuntimeException("Cannot receive SubscribeAck in 200 ms");
+            throw new RuntimeException("Cannot receive SubscribeAck in " + timeout + " " + timeUnit);
+        }
+    }
+
+    public void publish(MqttPublishMessage publishMessage, int timeout, TimeUnit timeUnit) {
+        final CountDownLatch publishResponseLatch = new CountDownLatch(1);
+        this.setCallback(msg -> {
+            receivedMsg.getAndSet(msg);
+            LOG.debug("Publish callback invocation, received message {}", msg.fixedHeader().messageType());
+            publishResponseLatch.countDown();
+
+            // clear the callback
+            setCallback(null);
+        });
+
+        LOG.debug("Sending PUBLISH message");
+        sendMessage(publishMessage);
+        LOG.debug("Sent PUBLISH message");
+
+        boolean notExpired;
+        try {
+            notExpired = publishResponseLatch.await(timeout, timeUnit);
+        } catch (InterruptedException e) {
+            throw new RuntimeException("Interrupted while waiting", e);
+        }
+
+        if (! notExpired) {
+            throw new RuntimeException("Cannot receive any message after PUBLISH in " + timeout + " " + timeUnit);
         }
     }
 
@@ -247,7 +301,7 @@ public class Client {
             .addSubscription(qos, topic)
             .build();
 
-        doSubscribe(subscribeMessage);
+        doSubscribe(subscribeMessage, TIMEOUT_DURATION.toMillis(), TimeUnit.MILLISECONDS);
         return this.receivedMsg.get();
     }
 

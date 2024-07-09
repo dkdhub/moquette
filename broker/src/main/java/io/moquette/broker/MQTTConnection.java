@@ -40,6 +40,7 @@ import java.nio.charset.CharsetDecoder;
 import java.nio.charset.StandardCharsets;
 import java.security.cert.Certificate;
 import java.security.cert.CertificateEncodingException;
+import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -132,7 +133,7 @@ final class MQTTConnection {
         this.postOffice.routeCommand(clientID, "PUBCOMP", () -> {
             checkMatchSessionLoop(clientID);
             bindedSession.processPubComp(messageID);
-            return clientID;
+            return null;
         });
     }
 
@@ -368,7 +369,7 @@ final class MQTTConnection {
             .receiveMaximum(INFLIGHT_WINDOW_SIZE)
             .retainAvailable(true)
             .wildcardSubscriptionAvailable(true)
-            .subscriptionIdentifiersAvailable(false)
+            .subscriptionIdentifiersAvailable(true)
             .sharedSubscriptionAvailable(true);
         return builder;
     }
@@ -624,6 +625,8 @@ final class MQTTConnection {
             return PostOffice.RouteResult.failed(clientId);
         }
 
+        final Instant expiry = extractExpiryFromProperty(msg);
+
         // retain else msg is cleaned by the NewNettyMQTTHandler and is not available
         // in execution by SessionEventLoop
         msg.retain();
@@ -634,7 +637,7 @@ final class MQTTConnection {
                     if (!isBoundToSession()) {
                         return null;
                     }
-                    postOffice.receivedPublishQos0(topic, username, clientId, msg);
+                    postOffice.receivedPublishQos0(this, username, clientId, msg, expiry);
                     return null;
                 }).ifFailed(msg::release);
             case AT_LEAST_ONCE:
@@ -642,7 +645,7 @@ final class MQTTConnection {
                     checkMatchSessionLoop(clientId);
                     if (!isBoundToSession())
                         return null;
-                    postOffice.receivedPublishQos1(this, topic, username, messageID, msg);
+                    postOffice.receivedPublishQos1(this, username, messageID, msg, expiry);
                     return null;
                 }).ifFailed(msg::release);
             case EXACTLY_ONCE: {
@@ -655,11 +658,11 @@ final class MQTTConnection {
                 });
                 if (!firstStepResult.isSuccess()) {
                     msg.release();
-                    LOG.trace("Failed to enqueue PUB QoS2 to session loop for  {}", clientId);
+                    LOG.trace("Failed to enqueue PUB QoS2 to session loop for {}", clientId);
                     return firstStepResult;
                 }
                 firstStepResult.completableFuture().thenRun(() ->
-                    postOffice.receivedPublishQos2(this, msg, username).completableFuture()
+                    postOffice.receivedPublishQos2(this, msg, username, expiry).completableFuture()
                 );
                 return firstStepResult;
             }
@@ -669,11 +672,35 @@ final class MQTTConnection {
         }
     }
 
+    private Instant extractExpiryFromProperty(MqttPublishMessage msg) {
+        MqttProperties.MqttProperty expiryProp = msg.variableHeader()
+            .properties()
+            .getProperty(MqttProperties.MqttPropertyType.PUBLICATION_EXPIRY_INTERVAL.value());
+        if (expiryProp == null) {
+            // publish message doesn't contain the expiry property, leave it as it is.
+            return Instant.MAX;
+        }
+        Integer expirySeconds = ((MqttProperties.IntegerProperty) expiryProp).value();
+
+        return Instant.now().plusSeconds(expirySeconds);
+    }
+
     void sendPubRec(int messageID) {
         LOG.trace("sendPubRec invoked, messageID: {}", messageID);
         MqttFixedHeader fixedHeader = new MqttFixedHeader(MqttMessageType.PUBREC, false, AT_MOST_ONCE,
             false, 0);
         MqttPubAckMessage pubRecMessage = new MqttPubAckMessage(fixedHeader, from(messageID));
+        sendIfWritableElseDrop(pubRecMessage);
+    }
+
+    void sendPubRec(int messageID, MqttReasonCodes.PubRec reasonCode) {
+        LOG.trace("sendPubRec for messageID: {}, reason code: {}", messageID, reasonCode);
+        MqttFixedHeader fixedHeader = new MqttFixedHeader(MqttMessageType.PUBREC, false, AT_MOST_ONCE,
+            false, 0);
+        MqttPubReplyMessageVariableHeader variableHeader = new MqttPubReplyMessageVariableHeader(messageID,
+            reasonCode.byteValue(), MqttProperties.NO_PROPERTIES);
+        MqttPubAckMessage pubRecMessage = new MqttPubAckMessage(fixedHeader, variableHeader);
+
         sendIfWritableElseDrop(pubRecMessage);
     }
 
@@ -748,6 +775,17 @@ final class MQTTConnection {
         sendIfWritableElseDrop(pubAckMessage);
     }
 
+    void sendPubAck(int messageID, MqttReasonCodes.PubAck reasonCode) {
+        LOG.trace("sendPubAck for messageID: {}, reason code: {}", messageID, reasonCode);
+        MqttFixedHeader fixedHeader = new MqttFixedHeader(MqttMessageType.PUBACK, false, AT_MOST_ONCE,
+            false, 0);
+        MqttPubReplyMessageVariableHeader variableHeader = new MqttPubReplyMessageVariableHeader(messageID,
+            reasonCode.byteValue(), MqttProperties.NO_PROPERTIES);
+        MqttPubAckMessage pubAckMessage = new MqttPubAckMessage(fixedHeader, variableHeader);
+
+        sendIfWritableElseDrop(pubAckMessage);
+    }
+
     private void sendPubCompMessage(int messageID) {
         LOG.trace("Sending PUBCOMP message messageId: {}", messageID);
         MqttFixedHeader fixedHeader = new MqttFixedHeader(MqttMessageType.PUBCOMP, false, AT_MOST_ONCE, false, 0);
@@ -763,41 +801,27 @@ final class MQTTConnection {
         return NettyUtils.userName(channel);
     }
 
-    public void sendPublishWithPacketId(Topic topic, MqttQoS qos, ByteBuf payload, boolean retained) {
-        final int packetId = nextPacketId();
-        MqttPublishMessage publishMsg = createPublishMessage(topic.toString(), qos, payload, packetId, retained);
-        sendPublish(publishMsg);
-    }
-
-    // TODO move this method in Session
-    void sendPublishQos0(Topic topic, MqttQoS qos, ByteBuf payload, boolean retained) {
-        MqttPublishMessage publishMsg = createPublishMessage(topic.toString(), qos, payload, 0, retained);
-        sendPublish(publishMsg);
-    }
-
-    static MqttPublishMessage createRetainedPublishMessage(String topic, MqttQoS qos, ByteBuf message) {
-        return createPublishMessage(topic, qos, message, 0, true);
-    }
-
-    static MqttPublishMessage createNonRetainedPublishMessage(String topic, MqttQoS qos, ByteBuf message) {
-        return createPublishMessage(topic, qos, message, 0, false);
-    }
-
-    static MqttPublishMessage createRetainedPublishMessage(String topic, MqttQoS qos, ByteBuf message,
-                                                           int messageId) {
-        return createPublishMessage(topic, qos, message, messageId, true);
-    }
-
     static MqttPublishMessage createNotRetainedPublishMessage(String topic, MqttQoS qos, ByteBuf message,
-                                                              int messageId) {
-        return createPublishMessage(topic, qos, message, messageId, false);
+                                                              int messageId, MqttProperties.MqttProperty... mqttProperties) {
+        return createPublishMessage(topic, qos, message, messageId, false, false, mqttProperties);
     }
 
-    private static MqttPublishMessage createPublishMessage(String topic, MqttQoS qos, ByteBuf message,
-                                                           int messageId, boolean retained) {
-        MqttFixedHeader fixedHeader = new MqttFixedHeader(MqttMessageType.PUBLISH, false, qos, retained, 0);
-        MqttPublishVariableHeader varHeader = new MqttPublishVariableHeader(topic, messageId);
+    static MqttPublishMessage createPublishMessage(String topic, MqttQoS qos, ByteBuf message,
+                                                           int messageId, boolean retained, boolean isDup,
+                                                           MqttProperties.MqttProperty... mqttProperties) {
+        MqttFixedHeader fixedHeader = new MqttFixedHeader(MqttMessageType.PUBLISH, isDup, qos, retained, 0);
+        MqttProperties props = new MqttProperties();
+        for (MqttProperties.MqttProperty mqttProperty : mqttProperties) {
+            props.add(mqttProperty);
+        }
+        MqttPublishVariableHeader varHeader = new MqttPublishVariableHeader(topic, messageId, props);
         return new MqttPublishMessage(fixedHeader, varHeader, message);
+    }
+
+    static MqttPublishMessage createNotRetainedDuplicatedPublishMessage(int packetId, Topic topic, MqttQoS qos,
+                                                                        ByteBuf payload,
+                                                                        MqttProperties.MqttProperty... mqttProperties) {
+        return createPublishMessage(topic.toString(), qos, payload, packetId, false, true, mqttProperties);
     }
 
     public void resendNotAckedPublishes() {
@@ -858,10 +882,15 @@ final class MQTTConnection {
     }
 
     void brokerDisconnect(MqttReasonCodes.Disconnect reasonCode) {
+        this.connected = false;
         final MqttMessage disconnectMsg = MqttMessageBuilders.disconnect()
             .reasonCode(reasonCode.byteValue())
             .build();
         channel.writeAndFlush(disconnectMsg)
             .addListener(ChannelFutureListener.CLOSE);
+    }
+
+    void disconnectSession() {
+        bindedSession.disconnect();
     }
 }

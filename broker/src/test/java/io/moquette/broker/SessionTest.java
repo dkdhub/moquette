@@ -6,6 +6,7 @@ import io.netty.buffer.ByteBufUtil;
 import io.netty.buffer.UnpooledByteBufAllocator;
 import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.handler.codec.mqtt.MqttQoS;
+import io.netty.handler.codec.mqtt.MqttSubscriptionOption;
 import io.netty.handler.codec.mqtt.MqttVersion;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -14,6 +15,7 @@ import static io.moquette.BrokerConstants.FLIGHT_BEFORE_RESEND_MS;
 import io.moquette.broker.subscriptions.Subscription;
 
 import java.time.Clock;
+import java.time.Instant;
 import java.util.Arrays;
 import org.assertj.core.api.Assertions;
 
@@ -21,7 +23,6 @@ import static io.moquette.broker.Session.INFINITE_EXPIRY;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static io.moquette.BrokerConstants.NO_BUFFER_FLUSH;
-import static org.junit.jupiter.api.Assertions.*;
 
 public class SessionTest {
 
@@ -67,7 +68,8 @@ public class SessionTest {
 
     private void sendQoS1To(Session client, Topic destinationTopic, String message) {
         final ByteBuf payload = ByteBufUtil.writeUtf8(UnpooledByteBufAllocator.DEFAULT, message);
-        client.sendNotRetainedPublishOnSessionAtQos(destinationTopic, MqttQoS.AT_LEAST_ONCE, payload);
+        final SessionRegistry.PublishedMessage publishedMessage = new SessionRegistry.PublishedMessage(destinationTopic, MqttQoS.AT_LEAST_ONCE, payload, false, Instant.MAX);
+        client.sendPublishOnSessionAtQos(publishedMessage);
     }
 
     @Test
@@ -115,9 +117,9 @@ public class SessionTest {
 
     @Test
     public void testRemoveSubscription() {
-        client.addSubscriptions(Arrays.asList(new Subscription(CLIENT_ID, new Topic("topic/one"), MqttQoS.AT_MOST_ONCE)));
+        client.addSubscriptions(Arrays.asList(new Subscription(CLIENT_ID, new Topic("topic/one"), MqttSubscriptionOption.onlyFromQos(MqttQoS.AT_MOST_ONCE))));
         Assertions.assertThat(client.getSubscriptions()).hasSize(1);
-        client.addSubscriptions(Arrays.asList(new Subscription(CLIENT_ID, new Topic("topic/one"), MqttQoS.EXACTLY_ONCE)));
+        client.addSubscriptions(Arrays.asList(new Subscription(CLIENT_ID, new Topic("topic/one"), MqttSubscriptionOption.onlyFromQos(MqttQoS.EXACTLY_ONCE))));
         Assertions.assertThat(client.getSubscriptions()).hasSize(1);
         client.removeSubscription(new Topic("topic/one"));
         Assertions.assertThat(client.getSubscriptions()).isEmpty();

@@ -1,11 +1,13 @@
 package io.moquette.broker.subscriptions;
 
-import io.netty.handler.codec.mqtt.MqttQoS;
+import io.netty.handler.codec.mqtt.MqttSubscriptionOption;
 
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
+import java.util.function.Supplier;
 
 public class CTrie {
 
@@ -16,31 +18,56 @@ public class CTrie {
 
         private final Topic topicFilter;
         private final String clientId;
-        private final MqttQoS requestedQoS;
-
+        private final MqttSubscriptionOption option;
         private boolean shared = false;
         private ShareName shareName;
+        private Optional<SubscriptionIdentifier> subscriptionIdOpt;
 
-        private SubscriptionRequest(String clientId, Topic topicFilter, MqttQoS requestedQoS) {
+        private SubscriptionRequest(String clientId, Topic topicFilter, MqttSubscriptionOption option, SubscriptionIdentifier subscriptionId) {
             this.topicFilter = topicFilter;
             this.clientId = clientId;
-            this.requestedQoS = requestedQoS;
+            this.option = option;
+            this.subscriptionIdOpt = Optional.of(subscriptionId);
+        }
+
+        private SubscriptionRequest(String clientId, Topic topicFilter, MqttSubscriptionOption option) {
+            this.topicFilter = topicFilter;
+            this.clientId = clientId;
+            this.option = option;
+            this.subscriptionIdOpt = Optional.empty();
         }
 
         public static SubscriptionRequest buildNonShared(Subscription subscription) {
-            return buildNonShared(subscription.clientId, subscription.topicFilter, subscription.getRequestedQos());
+            return buildNonShared(subscription.clientId, subscription.topicFilter, subscription.option());
         }
 
-        public static SubscriptionRequest buildNonShared(String clientId, Topic topicFilter, MqttQoS requestedQoS) {
-            return new SubscriptionRequest(clientId, topicFilter, requestedQoS);
+        public static SubscriptionRequest buildNonShared(String clientId, Topic topicFilter, MqttSubscriptionOption option) {
+            return new SubscriptionRequest(clientId, topicFilter, option);
         }
 
-        public static SubscriptionRequest buildShared(ShareName shareName, Topic topicFilter, String clientId, MqttQoS requestedQoS) {
+        public static SubscriptionRequest buildNonShared(String clientId, Topic topicFilter,
+                                                         MqttSubscriptionOption option, SubscriptionIdentifier subscriptionId) {
+            Objects.requireNonNull(subscriptionId, "SubscriptionId param can't be null");
+            return new SubscriptionRequest(clientId, topicFilter, option, subscriptionId);
+        }
+
+        public static SubscriptionRequest buildShared(ShareName shareName, Topic topicFilter, String clientId,
+                                                      MqttSubscriptionOption option, SubscriptionIdentifier subscriptionId) {
+            Objects.requireNonNull(subscriptionId, "SubscriptionId param can't be null");
+            return buildSharedHelper(shareName, topicFilter,
+                () -> new SubscriptionRequest(clientId, topicFilter, option, subscriptionId));
+        }
+
+        public static SubscriptionRequest buildShared(ShareName shareName, Topic topicFilter, String clientId, MqttSubscriptionOption option) {
+            return buildSharedHelper(shareName, topicFilter,
+                () -> buildNonShared(clientId, topicFilter, option));
+        }
+
+        private static SubscriptionRequest buildSharedHelper(ShareName shareName, Topic topicFilter, Supplier<SubscriptionRequest> instantiator) {
             if (topicFilter.headToken().name().startsWith("$share")) {
                 throw new IllegalArgumentException("Topic filter of a shared subscription can't contains $share and share name");
             }
-
-            SubscriptionRequest request = new SubscriptionRequest(clientId, topicFilter, requestedQoS);
+            SubscriptionRequest request = instantiator.get();
             request.shared = true;
             request.shareName = shareName;
             return request;
@@ -50,12 +77,20 @@ public class CTrie {
             return topicFilter;
         }
 
+        public MqttSubscriptionOption getOption() {
+            return option;
+        }
+
         public Subscription subscription() {
-            return new Subscription(clientId, topicFilter, requestedQoS);
+            return subscriptionIdOpt
+                .map(subscriptionIdentifier -> new Subscription(clientId, topicFilter, option, subscriptionIdentifier))
+                .orElseGet(() -> new Subscription(clientId, topicFilter, option));
         }
 
         public SharedSubscription sharedSubscription() {
-            return new SharedSubscription(shareName, topicFilter, clientId, requestedQoS);
+            return subscriptionIdOpt
+                .map(subId -> new SharedSubscription(shareName, topicFilter, clientId, option, subId))
+                .orElseGet(() -> new SharedSubscription(shareName, topicFilter, clientId, option));
         }
 
         public boolean isShared() {
@@ -70,6 +105,13 @@ public class CTrie {
             return clientId;
         }
 
+        public boolean hasSubscriptionIdentifier() {
+            return subscriptionIdOpt.isPresent();
+        }
+
+        public SubscriptionIdentifier getSubscriptionIdentifier() {
+            return subscriptionIdOpt.get();
+        }
     }
 
     /**
@@ -129,7 +171,8 @@ public class CTrie {
     private static final INode NO_PARENT = null;
 
     private enum Action {
-        OK, REPEAT
+        OK, REPEAT,
+        OK_NEW // used to indicate that the action was successful and the subscription created a new branch
     }
 
     INode root;
@@ -228,11 +271,15 @@ public class CTrie {
         return subscriptions;
     }
 
-    public void addToTree(SubscriptionRequest request) {
+    /**
+     * @return true if the subscription didn't exist.
+     * */
+    public boolean addToTree(SubscriptionRequest request) {
         Action res;
         do {
             res = insert(request.getTopicFilter(), this.root, request);
         } while (res == Action.REPEAT);
+        return res == Action.OK_NEW;
     }
 
     private Action insert(Topic topic, final INode inode, SubscriptionRequest request) {
@@ -273,7 +320,7 @@ public class CTrie {
         }
         updatedCnode.add(newInode);
 
-        return inode.compareAndSet(cnode, updatedCnode) ? Action.OK : Action.REPEAT;
+        return inode.compareAndSet(cnode, updatedCnode) ? Action.OK_NEW : Action.REPEAT;
     }
 
     private INode createPathRec(Topic topic, SubscriptionRequest request) {
