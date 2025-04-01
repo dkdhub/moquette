@@ -1,4 +1,15 @@
-Version 0.18-SNAPSHOT:
+Version 0.19-SNAPSHOT
+
+Version 0.18:
+   [fix] Update Netty to 4.1.116 and H2 2.1.214
+   [feature] Server keep alive: added configuration setting so that the broker can specify a keep alive other then the one selected by clients. (#789)
+   [feature] User properties: covered publish with user properties with tests and fixed publish of will messages. (#877)
+   [feature] Topic alias: implemented handling of topic alias received by publishers. (#873)
+   [feature] Flow-control: Handled client's receive maximum property to configure the inflight window through the client. (#858)
+   [feature] Generate correct MANIFEST.MF with bnd-maven-plugin. (#848)
+   [feature] Flow-control: implemented publish's quota management on the server side. (#852)
+   [fix] Incorrect reference used in compareAndSet in CTrie.cleanTomb. (#841)
+   [feature] Implement response-information property for request-response flow. (#840)
    [fix] Optimised page file opening for disk-based queues. (#837)
    [feature] Manage payload format indicator property, when set verify payload format. (#826)
    [refactoring] Refactory of PostOffice to pass publish message in hits entirety avoiding decomposition into single parameters. (#827)

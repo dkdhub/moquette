@@ -38,6 +38,7 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.stream.Collectors;
 
+import static io.moquette.BrokerConstants.INFLIGHT_WINDOW_SIZE;
 import static io.moquette.broker.Session.INFINITE_EXPIRY;
 
 public class SessionRegistry {
@@ -395,6 +396,12 @@ public class SessionRegistry {
         newSession = new Session(sessionData, clean, queue);
         newSession.markConnecting();
         sessionsRepository.saveSession(sessionData);
+        if (MQTTConnection.isNeedResponseInformation(msg)) {
+            // the responder client must have write access to this topic
+            // the requester client must have read access on this topic
+            authorizator.forceReadAccess(Topic.asTopic("/reqresp/response/" + clientId), clientId);
+            authorizator.forceWriteToAll(Topic.asTopic("/reqresp/response/" + clientId));
+        }
         return newSession;
     }
 
@@ -552,6 +559,7 @@ public class SessionRegistry {
         // Update all not clean session with the proper expiry date
         updateNotCleanSessionsWithProperExpire();
         queueRepository.close();
+        pool.values().forEach(Session::cleanUp);
     }
 
     private void updateNotCleanSessionsWithProperExpire() {

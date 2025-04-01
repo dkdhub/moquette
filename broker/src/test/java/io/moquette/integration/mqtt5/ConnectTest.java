@@ -13,6 +13,8 @@ import com.hivemq.client.mqtt.mqtt5.message.disconnect.Mqtt5DisconnectReasonCode
 import com.hivemq.client.mqtt.mqtt5.message.publish.Mqtt5Publish;
 import com.hivemq.client.mqtt.mqtt5.message.publish.Mqtt5PublishResult;
 import com.hivemq.client.mqtt.mqtt5.message.publish.Mqtt5WillPublishBuilder;
+import io.moquette.broker.config.FluentConfig;
+import io.moquette.broker.config.IConfig;
 import io.moquette.testclient.Client;
 import io.netty.handler.codec.mqtt.*;
 import org.awaitility.Awaitility;
@@ -31,7 +33,6 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
-import java.util.function.LongSupplier;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -72,9 +73,38 @@ class ConnectTest extends AbstractServerIntegrationTest {
     }
 
     @Test
-    public void sendConnectOnDisconnectedConnection() {
+    public void givenServerKeepAliveConfiguredThenConnectAckMustRespectIt() throws IOException {
+        stopServer();
+        IConfig config = new FluentConfig()
+            .dataPath(dbPath)
+            .enablePersistence()
+            .port(1883)
+            .disableTelemetry()
+            .persistentQueueType(FluentConfig.PersistentQueueType.SEGMENTED)
+            .serverKeepAlive(Duration.ofSeconds(12))
+            .build();
+        startServer(config);
+
+        Mqtt5BlockingClient client = MqttClient.builder()
+            .useMqttVersion5()
+            .identifier("simple_connect_test")
+            .serverHost("localhost")
+            .serverPort(1883)
+            .buildBlocking();
+        final Mqtt5ConnAck connectAck = client.connect();
+        assertEquals(Mqtt5ConnAckReasonCode.SUCCESS, connectAck.getReasonCode(), "Accept plain connection");
+        assertTrue(connectAck.getServerKeepAlive().isPresent());
+        connectAck.getServerKeepAlive().ifPresent(serverKeepAlive -> {
+            assertEquals(12 ,serverKeepAlive);
+        });
+
+        client.disconnect();
+    }
+
+    @Test
+    public void sendConnectOnDisconnectedConnection() throws InterruptedException {
         MqttConnAckMessage connAck = lowLevelClient.connectV5();
-        assertConnectionAccepted(connAck, "Connection must be accepted");
+        TestUtils.assertConnectionAccepted(connAck, "Connection must be accepted");
         lowLevelClient.disconnect();
 
         try {
@@ -86,7 +116,7 @@ class ConnectTest extends AbstractServerIntegrationTest {
     }
 
     @Test
-    public void receiveInflightPublishesAfterAReconnect() {
+    public void receiveInflightPublishesAfterAReconnect() throws InterruptedException {
         final Mqtt5BlockingClient publisher = MqttClient.builder()
             .useMqttVersion5()
             .identifier("publisher")
@@ -97,7 +127,7 @@ class ConnectTest extends AbstractServerIntegrationTest {
         assertEquals(Mqtt5ConnAckReasonCode.SUCCESS, connectAck.getReasonCode(), "Publisher connected");
 
         final MqttConnAckMessage connAck = lowLevelClient.connectV5();
-        assertConnectionAccepted(connAck, "Connection must be accepted");
+        TestUtils.assertConnectionAccepted(connAck, "Connection must be accepted");
         lowLevelClient.subscribe("/test", MqttQoS.AT_LEAST_ONCE);
 
         final Mqtt5PublishResult pubResult = publisher.publishWith()
@@ -111,7 +141,7 @@ class ConnectTest extends AbstractServerIntegrationTest {
 
         // reconnect the raw subscriber
         final Client reconnectingSubscriber = new Client("localhost").clientId("subscriber");
-        assertConnectionAccepted(reconnectingSubscriber.connectV5(), "Connection must be accepted");
+        TestUtils.assertConnectionAccepted(reconnectingSubscriber.connectV5(), "Connection must be accepted");
 
         Awaitility.await()
             .atMost(2, TimeUnit.SECONDS)
@@ -128,12 +158,9 @@ class ConnectTest extends AbstractServerIntegrationTest {
             publishPayload = "Fake Payload";
         }
         assertEquals("Hello", publishPayload, "The inflight payload from previous subscription MUST be received");
+        acknowledge(opt.get().variableHeader().packetId(), reconnectingSubscriber);
 
         reconnectingSubscriber.disconnect();
-    }
-
-    public static void assertConnectionAccepted(MqttConnAckMessage connAck, String message) {
-        assertEquals(MqttConnectReturnCode.CONNECTION_ACCEPTED, connAck.variableHeader().connectReturnCode(), message);
     }
 
     @Test
@@ -161,11 +188,39 @@ class ConnectTest extends AbstractServerIntegrationTest {
 
         TestUtils.verifyPublishedMessage(testamentSubscriber, 10,
             (Mqtt5Publish message) -> {
-                final String payload = new String(message.getPayloadAsBytes(), StandardCharsets.UTF_8);
-                assertEquals("Goodbye", payload, "Will message must be received");
+                verifyPayloadInUTF8(message, "Goodbye");
 
                 long expiry = message.getMessageExpiryInterval().orElse(-1L);
                 assertEquals(messageExpiry, expiry);
+            });
+    }
+
+    @Test
+    public void givenWillPropertiesWithUserPropertySetDuringConnectionWhenWillPublishIsTriggeredThenAlsoTheUserPropertiesAreSent() throws InterruptedException {
+        int messageExpiry = 5;
+        Mqtt5ConnectBuilder connectBuilder = defaultWillBuilder(1)
+            .messageExpiryInterval(messageExpiry)
+            .userProperties()
+                .add("content-type", "text/plain")
+                .applyUserProperties()
+            .applyWillPublish();
+
+        final Mqtt5BlockingClient clientWithWill =
+            createAndConnectWithBuilder("simple_client", connectBuilder);
+
+        final Mqtt5BlockingClient testamentSubscriber = createAndConnectClientListeningToTestament();
+
+        // schedule a bad disconnect
+        scheduleDisconnectWithErrorCode(clientWithWill, Duration.ofMillis(500));
+
+        TestUtils.verifyPublishedMessage(testamentSubscriber, 10,
+            (Mqtt5Publish message) -> {
+                verifyPayloadInUTF8(message, "Goodbye");
+
+                long expiry = message.getMessageExpiryInterval().orElse(-1L);
+                assertEquals(messageExpiry, expiry);
+
+                UserPropertiesTest.verifyContainUserProperty(message, "content-type", "text/plain");
             });
     }
 
@@ -185,30 +240,32 @@ class ConnectTest extends AbstractServerIntegrationTest {
         final Mqtt5BlockingClient clientWithWill = createAndConnectClientWithWillTestament(clientId);
 
         final Mqtt5BlockingClient testamentSubscriber = createAndConnectClientListeningToTestament();
+        try (Mqtt5BlockingClient.Mqtt5Publishes testamentListener = testamentSubscriber.publishes(MqttGlobalPublishFilter.ALL)) {
 
-        // client trigger a will message, disconnecting with bad reason code
-        final Mqtt5Disconnect malformedPacketReason = Mqtt5Disconnect.builder()
-            .reasonCode(Mqtt5DisconnectReasonCode.MALFORMED_PACKET)
-            .build();
-        clientWithWill.disconnect(malformedPacketReason);
+            // client trigger a will message, disconnecting with bad reason code
+            final Mqtt5Disconnect malformedPacketReason = Mqtt5Disconnect.builder()
+                .reasonCode(Mqtt5DisconnectReasonCode.MALFORMED_PACKET)
+                .build();
+            clientWithWill.disconnect(malformedPacketReason);
 
-        // wait no will is published
-        verifyNoTestamentIsPublished(testamentSubscriber, unused -> {
-            // reconnect another client with same clientId
-            final Mqtt5BlockingClient client = MqttClient.builder()
-                .useMqttVersion5()
-                .identifier(clientId)
-                .serverHost("localhost")
-                .serverPort(1883)
-                .buildBlocking();
-            Mqtt5ConnAck connectAck = client.connect();
-            assertEquals(Mqtt5ConnAckReasonCode.SUCCESS, connectAck.getReasonCode(), "Client connected");
+            // wait no will is published
+            verifyNoTestamentIsPublished(testamentListener, unused -> {
+                // reconnect another client with same clientId
+                final Mqtt5BlockingClient client = MqttClient.builder()
+                    .useMqttVersion5()
+                    .identifier(clientId)
+                    .serverHost("localhost")
+                    .serverPort(1883)
+                    .buildBlocking();
+                Mqtt5ConnAck connectAck = client.connect();
+                assertEquals(Mqtt5ConnAckReasonCode.SUCCESS, connectAck.getReasonCode(), "Client connected");
 
-        }, Duration.ofSeconds(10));
+            }, Duration.ofSeconds(10));
+        }
     }
 
-    private static void verifyNoTestamentIsPublished(Mqtt5BlockingClient testamentSubscriber, Consumer<Void> action, Duration timeout) throws InterruptedException {
-        verifyNoPublish(testamentSubscriber, action, timeout, "No will message should be published");
+    private static void verifyNoTestamentIsPublished(Mqtt5BlockingClient.Mqtt5Publishes testamentListener, Consumer<Void> action, Duration timeout) throws InterruptedException {
+        verifyNoPublish(testamentListener, action, timeout, "No will message should be published");
     }
 
     @Test
@@ -235,12 +292,14 @@ class ConnectTest extends AbstractServerIntegrationTest {
         final Mqtt5BlockingClient clientWithWill = createAndConnectClientWithWillTestament(clientId,  10, 60);
 
         final Mqtt5BlockingClient testamentSubscriber = createAndConnectClientListeningToTestament();
+        try (Mqtt5BlockingClient.Mqtt5Publishes testamentListener = testamentSubscriber.publishes(MqttGlobalPublishFilter.ALL)) {
 
-        // wait no will is published
-        verifyNoTestamentIsPublished(testamentSubscriber, unused -> {
-            // normal session disconnection
-            clientWithWill.disconnect(Mqtt5Disconnect.builder().build());
-        }, Duration.ofSeconds(10));
+            // wait no will is published
+            verifyNoTestamentIsPublished(testamentListener, unused -> {
+                // normal session disconnection
+                clientWithWill.disconnect(Mqtt5Disconnect.builder().build());
+            }, Duration.ofSeconds(10));
+        }
     }
 
     @Test
@@ -250,14 +309,16 @@ class ConnectTest extends AbstractServerIntegrationTest {
         final Mqtt5BlockingClient clientWithWill = createAndConnectClientWithWillTestament(clientId,  10, 60);
 
         final Mqtt5BlockingClient testamentSubscriber = createAndConnectClientListeningToTestament();
+        try (Mqtt5BlockingClient.Mqtt5Publishes testamentListener = testamentSubscriber.publishes(MqttGlobalPublishFilter.ALL)) {
 
-        // wait no will is published
-        verifyNoTestamentIsPublished(testamentSubscriber, unused -> {
-            // normal session disconnection with will
-            clientWithWill.disconnect(Mqtt5Disconnect.builder()
-                .reasonCode(Mqtt5DisconnectReasonCode.DISCONNECT_WITH_WILL_MESSAGE)
-                .build());
-        }, Duration.ofSeconds(10));
+            // wait no will is published
+            verifyNoTestamentIsPublished(testamentListener, unused -> {
+                // normal session disconnection with will
+                clientWithWill.disconnect(Mqtt5Disconnect.builder()
+                    .reasonCode(Mqtt5DisconnectReasonCode.DISCONNECT_WITH_WILL_MESSAGE)
+                    .build());
+            }, Duration.ofSeconds(10));
+        }
     }
 
     @Test
@@ -312,7 +373,7 @@ class ConnectTest extends AbstractServerIntegrationTest {
 
     @NotNull
     private static Mqtt5BlockingClient createAndConnectClientWithWillTestament(String clientId, int delayInSeconds) {
-        Mqtt5WillPublishBuilder.Nested.Complete<? extends Mqtt5ConnectBuilder> willPublishBuilder = deafaultWillBuilder(delayInSeconds);
+        Mqtt5WillPublishBuilder.Nested.Complete<? extends Mqtt5ConnectBuilder> willPublishBuilder = defaultWillBuilder(delayInSeconds);
 
         Mqtt5ConnectBuilder connectBuilder = willPublishBuilder.applyWillPublish();
 
@@ -320,7 +381,7 @@ class ConnectTest extends AbstractServerIntegrationTest {
     }
 
     @NotNull
-    private static Mqtt5WillPublishBuilder.Nested.Complete<? extends Mqtt5ConnectBuilder> deafaultWillBuilder(int delayInSeconds) {
+    private static Mqtt5WillPublishBuilder.Nested.Complete<? extends Mqtt5ConnectBuilder> defaultWillBuilder(int delayInSeconds) {
         Mqtt5WillPublishBuilder.Nested.Complete<? extends Mqtt5ConnectBuilder> willPublishBuilder = Mqtt5Connect.builder()
             .keepAlive(10)
             .willPublish()
@@ -335,10 +396,10 @@ class ConnectTest extends AbstractServerIntegrationTest {
     }
 
     @NotNull
-    private static Mqtt5BlockingClient createAndConnectClientWithWillTestamentAndMessageExpiry(String clientId,
-                                                                                               int delayInSeconds,
-                                                                                               int messageExpirySeconds) {
-        Mqtt5WillPublishBuilder.Nested.Complete<? extends Mqtt5ConnectBuilder> willPublishBuilder = deafaultWillBuilder(delayInSeconds);
+    static Mqtt5BlockingClient createAndConnectClientWithWillTestamentAndMessageExpiry(String clientId,
+                                                                                       int delayInSeconds,
+                                                                                       int messageExpirySeconds) {
+        Mqtt5WillPublishBuilder.Nested.Complete<? extends Mqtt5ConnectBuilder> willPublishBuilder = defaultWillBuilder(delayInSeconds);
 
         willPublishBuilder.messageExpiryInterval(messageExpirySeconds);
 

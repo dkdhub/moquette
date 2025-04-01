@@ -5,6 +5,7 @@ import io.moquette.broker.Server;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.Locale;
 import java.util.Properties;
 import java.util.function.Consumer;
@@ -17,21 +18,24 @@ import static io.moquette.broker.config.IConfig.BUFFER_FLUSH_MS_PROPERTY_NAME;
 import static io.moquette.broker.config.IConfig.DATA_PATH_PROPERTY_NAME;
 import static io.moquette.broker.config.IConfig.DEFAULT_NETTY_MAX_BYTES_IN_MESSAGE;
 import static io.moquette.broker.config.IConfig.ENABLE_TELEMETRY_NAME;
-import static io.moquette.broker.config.IConfig.PEER_CERTIFICATE_AS_USERNAME;
-import static io.moquette.broker.config.IConfig.PORT_PROPERTY_NAME;
+import static io.moquette.broker.config.IConfig.HOST_PROPERTY_NAME;
 import static io.moquette.broker.config.IConfig.JKS_PATH_PROPERTY_NAME;
 import static io.moquette.broker.config.IConfig.KEY_MANAGER_PASSWORD_PROPERTY_NAME;
 import static io.moquette.broker.config.IConfig.KEY_STORE_PASSWORD_PROPERTY_NAME;
 import static io.moquette.broker.config.IConfig.KEY_STORE_TYPE;
 import static io.moquette.broker.config.IConfig.NETTY_MAX_BYTES_PROPERTY_NAME;
 import static io.moquette.broker.config.IConfig.PASSWORD_FILE_PROPERTY_NAME;
+import static io.moquette.broker.config.IConfig.PEER_CERTIFICATE_AS_USERNAME;
 import static io.moquette.broker.config.IConfig.PERSISTENCE_ENABLED_PROPERTY_NAME;
 import static io.moquette.broker.config.IConfig.PERSISTENT_CLIENT_EXPIRATION_PROPERTY_NAME;
 import static io.moquette.broker.config.IConfig.PERSISTENT_QUEUE_TYPE_PROPERTY_NAME;
-import static io.moquette.broker.config.IConfig.HOST_PROPERTY_NAME;
+import static io.moquette.broker.config.IConfig.PORT_PROPERTY_NAME;
+import static io.moquette.broker.config.IConfig.RECEIVE_MAXIMUM;
+import static io.moquette.broker.config.IConfig.SERVER_KEEP_ALIVE_PROPERTY_NAME;
 import static io.moquette.broker.config.IConfig.SESSION_QUEUE_SIZE;
 import static io.moquette.broker.config.IConfig.SSL_PORT_PROPERTY_NAME;
 import static io.moquette.broker.config.IConfig.SSL_PROVIDER;
+import static io.moquette.broker.config.IConfig.TOPIC_ALIAS_MAXIMUM_PROPERTY_NAME;
 import static io.moquette.broker.config.IConfig.WEB_SOCKET_PORT_PROPERTY_NAME;
 
 /**
@@ -200,6 +204,22 @@ public class FluentConfig {
 
     public FluentConfig enableTelemetry() {
         configAccumulator.put(ENABLE_TELEMETRY_NAME, "true");
+        return this;
+    }
+
+    public FluentConfig receiveMaximum(int receiveMaximum) {
+        configAccumulator.put(RECEIVE_MAXIMUM, Integer.valueOf(receiveMaximum).toString());
+        return this;
+    }
+
+    public FluentConfig topicAliasMaximum(int topicAliasMaximum) {
+        configAccumulator.put(TOPIC_ALIAS_MAXIMUM_PROPERTY_NAME, Integer.valueOf(topicAliasMaximum).toString());
+        return this;
+    }
+
+    public FluentConfig serverKeepAlive(Duration keepAliveSeconds) {
+        int seconds = (int) keepAliveSeconds.toMillis() / 1_000;
+        configAccumulator.put(SERVER_KEEP_ALIVE_PROPERTY_NAME, seconds + "s");
         return this;
     }
 

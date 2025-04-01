@@ -42,13 +42,13 @@ import java.security.cert.Certificate;
 import java.security.cert.CertificateEncodingException;
 import java.time.Instant;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import javax.net.ssl.SSLPeerUnverifiedException;
 
-import static io.moquette.BrokerConstants.INFLIGHT_WINDOW_SIZE;
 import static io.netty.channel.ChannelFutureListener.CLOSE_ON_FAILURE;
 import static io.netty.channel.ChannelFutureListener.FIRE_EXCEPTION_ON_FAILURE;
 import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.*;
@@ -68,10 +68,29 @@ final class MQTTConnection {
     private final IAuthenticator authenticator;
     private final SessionRegistry sessionRegistry;
     private final PostOffice postOffice;
+    private final int topicAliasMaximum;
     private volatile boolean connected;
     private final AtomicInteger lastPacketId = new AtomicInteger(0);
     private Session bindedSession;
     private int protocolVersion;
+    private Quota receivedQuota;
+    private Quota sendQuota;
+    private TopicAliasMapping aliasMappings;
+
+    static final class ErrorCodeException extends Exception {
+
+        private final String hexErrorCode;
+        private final MqttReasonCodes.Disconnect errorCode;
+
+        public ErrorCodeException(MqttReasonCodes.Disconnect disconnectError) {
+            errorCode = disconnectError;
+            hexErrorCode = Integer.toHexString(disconnectError.byteValue());
+        }
+
+        public MqttReasonCodes.Disconnect getErrorCode() {
+            return errorCode;
+        }
+    }
 
     MQTTConnection(Channel channel, BrokerConfiguration brokerConfig, IAuthenticator authenticator,
                    SessionRegistry sessionRegistry, PostOffice postOffice) {
@@ -82,6 +101,7 @@ final class MQTTConnection {
         this.postOffice = postOffice;
         this.connected = false;
         this.protocolVersion = UNDEFINED_VERSION;
+        this.topicAliasMaximum = brokerConfig.topicAliasMaximum();
     }
 
     void handleMessage(MqttMessage msg) {
@@ -162,6 +182,17 @@ final class MQTTConnection {
         });
     }
 
+    /**
+     * Factory method
+     * */
+    public static Quota createQuota(int receiveMaximum) {
+        return new LimitedQuota(receiveMaximum);
+    }
+
+    Quota sendQuota() {
+        return sendQuota;
+    }
+
     PostOffice.RouteResult processConnect(MqttConnectMessage msg) {
         MqttConnectPayload payload = msg.payload();
         String clientId = payload.clientIdentifier();
@@ -178,7 +209,7 @@ final class MQTTConnection {
         }
         final boolean cleanSession = msg.variableHeader().isCleanSession();
         final boolean serverGeneratedClientId;
-        if (clientId == null || clientId.length() == 0) {
+        if (clientId == null || clientId.isEmpty()) {
             if (isNotProtocolVersion(msg, MqttVersion.MQTT_5)) {
                 if (!brokerConfig.isAllowZeroByteClientId()) {
                     LOG.info("Broker doesn't permit MQTT empty client ID. Username: {}", username);
@@ -214,6 +245,15 @@ final class MQTTConnection {
             return PostOffice.RouteResult.failed(clientId);
         }
 
+        // initialize topic alias mapping
+        if (isProtocolVersion(msg, MqttVersion.MQTT_5)) {
+            aliasMappings = new TopicAliasMapping();
+        }
+
+        receivedQuota = createQuota(brokerConfig.receiveMaximum());
+
+        sendQuota = retrieveSendQuota(msg);
+
         final String sessionId = clientId;
         protocolVersion = msg.variableHeader().version();
         return postOffice.routeCommand(clientId, "CONN", () -> {
@@ -221,6 +261,28 @@ final class MQTTConnection {
             executeConnect(msg, sessionId, serverGeneratedClientId);
             return null;
         });
+    }
+
+    private Quota retrieveSendQuota(MqttConnectMessage msg) {
+        if (isProtocolVersion(msg, MqttVersion.MQTT_3_1) || isProtocolVersion(msg, MqttVersion.MQTT_3_1_1)) {
+            // for protocol versions that didn't define explicit
+            // the receiver maximum and without specification of flow control
+            // define one by the default.
+            return createQuota(BrokerConstants.INFLIGHT_WINDOW_SIZE);
+        }
+
+        MqttProperties.IntegerProperty receiveMaximumProperty = (MqttProperties.IntegerProperty) msg.variableHeader()
+            .properties()
+            .getProperty(MqttProperties.MqttPropertyType.RECEIVE_MAXIMUM.value());
+        if (receiveMaximumProperty == null) {
+            return createQuota(BrokerConstants.RECEIVE_MAXIMUM);
+        }
+        return createQuota(receiveMaximumProperty.value());
+    }
+
+    // only for test
+    protected void assignSendQuota(Quota quota) {
+        this.sendQuota = quota;
     }
 
     private void checkMatchSessionLoop(String clientId) {
@@ -281,7 +343,26 @@ final class MQTTConnection {
             .sessionPresent(isSessionAlreadyPresent);
         if (isProtocolVersion(msg, MqttVersion.MQTT_5)) {
             // set properties for MQTT 5
-            final MqttProperties ackProperties = prepareConnAckProperties(serverGeneratedClientId, clientId);
+            ConnAckPropertiesBuilder connAckPropertiesBuilder = prepareConnAckPropertiesBuilder(serverGeneratedClientId, clientId);
+            if (isNeedResponseInformation(msg)) {
+                // the responder and requested access to the topic are already configured during session creation
+                // in SessionRegistry
+                connAckPropertiesBuilder.responseInformation("/reqresp/response/" + clientId);
+            }
+
+            if (receivedQuota.hasLimit()) {
+                connAckPropertiesBuilder.receiveMaximum(receivedQuota.getMaximum());
+            }
+
+            if (topicAliasMaximum != BrokerConstants.DISABLED_TOPIC_ALIAS) {
+                connAckPropertiesBuilder.topicAliasMaximum(topicAliasMaximum);
+            }
+
+            if (brokerConfig.getServerKeepAlive().isPresent()) {
+                connAckPropertiesBuilder.serverKeepAlive(brokerConfig.getServerKeepAlive().get());
+            }
+
+            final MqttProperties ackProperties = connAckPropertiesBuilder.build();
             connAckBuilder.properties(ackProperties);
         }
         final MqttConnAckMessage ackMessage = connAckBuilder.build();
@@ -319,6 +400,7 @@ final class MQTTConnection {
                         LOG.trace("dispatch connection: {}", msg);
                     }
                 } else {
+                    // here the session should still be in CONNECTING state
                     sessionRegistry.connectionClosed(bindedSession);
                     LOG.error("CONNACK send failed, cleanup session and close the connection", future.cause());
                     channel.close();
@@ -326,6 +408,16 @@ final class MQTTConnection {
 
             }
         });
+    }
+
+    /**
+     * @return true iff message contains property REQUEST_RESPONSE_INFORMATION and is positive.
+     * */
+    static boolean isNeedResponseInformation(MqttConnectMessage msg) {
+        MqttProperties.IntegerProperty requestRespInfo = (MqttProperties.IntegerProperty) msg.variableHeader()
+            .properties()
+            .getProperty(MqttProperties.MqttPropertyType.REQUEST_RESPONSE_INFORMATION.value());
+        return requestRespInfo != null && requestRespInfo.value() >= 1;
     }
 
     /**
@@ -352,10 +444,6 @@ final class MQTTConnection {
         return true;
     }
 
-    private MqttProperties prepareConnAckProperties(boolean serverGeneratedClientId, String clientId) {
-        return prepareConnAckPropertiesBuilder(serverGeneratedClientId, clientId).build();
-    }
-
     private ConnAckPropertiesBuilder prepareConnAckPropertiesBuilder(boolean serverGeneratedClientId, String clientId) {
         final ConnAckPropertiesBuilder builder = new ConnAckPropertiesBuilder();
         // default maximumQos is 2, [MQTT-3.2.2-10]
@@ -366,7 +454,6 @@ final class MQTTConnection {
 
         builder
             .sessionExpiryInterval(BrokerConstants.INFINITE_SESSION_EXPIRY)
-            .receiveMaximum(INFLIGHT_WINDOW_SIZE)
             .retainAvailable(true)
             .wildcardSubscriptionAvailable(true)
             .subscriptionIdentifiersAvailable(true)
@@ -381,6 +468,13 @@ final class MQTTConnection {
 
     private void initializeKeepAliveTimeout(Channel channel, MqttConnectMessage msg, String clientId) {
         int keepAlive = msg.variableHeader().keepAliveTimeSeconds();
+
+        // force server keep alive if configured
+        if (brokerConfig.getServerKeepAlive().isPresent()) {
+            int serverKeepAlive = brokerConfig.getServerKeepAlive().get();
+            LOG.info("Forcing server keep alive ({}) over client selection ({})", serverKeepAlive, keepAlive);
+            keepAlive = serverKeepAlive;
+        }
         NettyUtils.keepAlive(channel, keepAlive);
         NettyUtils.cleanSession(channel, msg.variableHeader().isCleanSession());
         NettyUtils.clientID(channel, clientId);
@@ -614,7 +708,26 @@ final class MQTTConnection {
         final String clientId = getClientId();
         final int messageID = msg.variableHeader().packetId();
         LOG.trace("Processing PUBLISH message, topic: {}, messageId: {}, qos: {}", topicName, messageID, qos);
-        final Topic topic = new Topic(topicName);
+        Topic topic = new Topic(topicName);
+
+        if (isProtocolVersion5()) {
+            MqttProperties.MqttProperty topicAlias = msg.variableHeader()
+                .properties().getProperty(MqttProperties.MqttPropertyType.TOPIC_ALIAS.value());
+            if (topicAlias != null) {
+                try {
+                    Optional<String> mappedTopicName = updateAndMapTopicAlias((MqttProperties.IntegerProperty) topicAlias, topicName);
+                    final String translatedTopicName = mappedTopicName.orElse(topicName);
+                    msg = copyPublishMessageExceptTopicAlias(msg, translatedTopicName, messageID);
+                    topic = new Topic(translatedTopicName);
+                } catch (ErrorCodeException e) {
+                    brokerDisconnect(e.getErrorCode());
+                    disconnectSession();
+                    dropConnection();
+                    return PostOffice.RouteResult.failed(clientId);
+                }
+            }
+        }
+
         if (!topic.isValid()) {
             LOG.debug("Drop connection because of invalid topic format");
             dropConnection();
@@ -629,7 +742,8 @@ final class MQTTConnection {
 
         // retain else msg is cleaned by the NewNettyMQTTHandler and is not available
         // in execution by SessionEventLoop
-        msg.retain();
+        Utils.retain(msg, PostOffice.BT_PUB_IN);
+        final MqttPublishMessage finalMsg = msg;
         switch (qos) {
             case AT_MOST_ONCE:
                 return postOffice.routeCommand(clientId, "PUB QoS0", () -> {
@@ -637,32 +751,55 @@ final class MQTTConnection {
                     if (!isBoundToSession()) {
                         return null;
                     }
-                    postOffice.receivedPublishQos0(this, username, clientId, msg, expiry);
+                    postOffice.receivedPublishQos0(this, username, clientId, finalMsg, expiry);
                     return null;
-                }).ifFailed(msg::release);
+                }).ifFailed(() -> Utils.release(finalMsg, PostOffice.BT_PUB_IN + " - failed"));
             case AT_LEAST_ONCE:
+                if (!receivedQuota.hasFreeSlots()) {
+                    LOG.warn("Client {} exceeded the quota {} processing QoS1, disconnecting it", clientId, receivedQuota);
+                    Utils.release(msg, PostOffice.BT_PUB_IN + " - QoS1 exceeded quota");
+                    brokerDisconnect(MqttReasonCodes.Disconnect.RECEIVE_MAXIMUM_EXCEEDED);
+                    disconnectSession();
+                    dropConnection();
+                    return null;
+                }
+
                 return postOffice.routeCommand(clientId, "PUB QoS1", () -> {
                     checkMatchSessionLoop(clientId);
                     if (!isBoundToSession())
                         return null;
-                    postOffice.receivedPublishQos1(this, username, messageID, msg, expiry);
+                    receivedQuota.consumeSlot();
+                    postOffice.receivedPublishQos1(this, username, messageID, finalMsg, expiry)
+                        .completableFuture().thenRun(() -> {
+                            receivedQuota.releaseSlot();
+                        });
                     return null;
-                }).ifFailed(msg::release);
+                }).ifFailed(() -> Utils.release(finalMsg, PostOffice.BT_PUB_IN + " - failed"));
             case EXACTLY_ONCE: {
+                if (!receivedQuota.hasFreeSlots()) {
+                    LOG.warn("Client {} exceeded the quota {} processing QoS2, disconnecting it", clientId, receivedQuota);
+                    Utils.release(finalMsg, PostOffice.BT_PUB_IN + " - phase 1 QoS2 exceeded quota");
+                    brokerDisconnect(MqttReasonCodes.Disconnect.RECEIVE_MAXIMUM_EXCEEDED);
+                    disconnectSession();
+                    dropConnection();
+                    return null;
+                }
+
                 final PostOffice.RouteResult firstStepResult = postOffice.routeCommand(clientId, "PUB QoS2", () -> {
                     checkMatchSessionLoop(clientId);
                     if (!isBoundToSession())
                         return null;
-                    bindedSession.receivedPublishQos2(messageID, msg);
+                    bindedSession.receivedPublishQos2(messageID, finalMsg);
+                    receivedQuota.consumeSlot();
                     return null;
                 });
                 if (!firstStepResult.isSuccess()) {
-                    msg.release();
+                    Utils.release(msg, PostOffice.BT_PUB_IN + " - failed");
                     LOG.trace("Failed to enqueue PUB QoS2 to session loop for {}", clientId);
                     return firstStepResult;
                 }
                 firstStepResult.completableFuture().thenRun(() ->
-                    postOffice.receivedPublishQos2(this, msg, username, expiry).completableFuture()
+                    postOffice.receivedPublishQos2(this, finalMsg, username, expiry).completableFuture()
                 );
                 return firstStepResult;
             }
@@ -670,6 +807,55 @@ final class MQTTConnection {
                 LOG.error("Unknown QoS-Type:{}", qos);
                 return PostOffice.RouteResult.failed(clientId, "Unknown QoS-");
         }
+    }
+
+    private Optional<String> updateAndMapTopicAlias(MqttProperties.IntegerProperty topicAlias, String topicName) throws ErrorCodeException {
+        if (topicAliasMaximum == BrokerConstants.DISABLED_TOPIC_ALIAS) {
+            // client is sending a topic alias when the feature was disabled form the server
+            LOG.info("Dropping connection {}, received a PUBLISH with topic alias while the feature is not enaled on the broker", channel);
+            throw new ErrorCodeException(MqttReasonCodes.Disconnect.PROTOCOL_ERROR);
+        }
+        MqttProperties.IntegerProperty topicAliasTyped = topicAlias;
+        if (topicAliasTyped.value() == 0 || topicAliasTyped.value() > topicAliasMaximum) {
+            // invalid topic alias value
+            LOG.info("Dropping connection {}, received a topic alias ({}) outside of range (0..{}]",
+                channel, topicAliasTyped.value(), topicAliasMaximum);
+            throw new ErrorCodeException(MqttReasonCodes.Disconnect.TOPIC_ALIAS_INVALID);
+        }
+
+        Optional<String> mappedTopicName = aliasMappings.topicFromAlias(topicAliasTyped.value());
+        if (mappedTopicName.isPresent()) {
+            // already established a mapping for the Topic Alias
+            if (topicName != null) {
+                // contains a topic name then update the mapping
+                aliasMappings.update(topicName, topicAliasTyped.value());
+            }
+        } else {
+            // does not already have a mapping for this Topic Alias
+            if (topicName.isEmpty()) {
+                // protocol error, not present mapping, topic alias is present and no topic name
+                throw new ErrorCodeException(MqttReasonCodes.Disconnect.PROTOCOL_ERROR);
+            }
+            // update the mapping
+            aliasMappings.update(topicName, topicAliasTyped.value());
+        }
+        return mappedTopicName;
+    }
+
+    private static MqttPublishMessage copyPublishMessageExceptTopicAlias(MqttPublishMessage msg, String translatedTopicName, int messageID) {
+        // Replace the topicName with the one retrieved and remove the topic alias property
+        // to avoid to forward or store.
+        final MqttProperties rewrittenProps = new MqttProperties();
+        for (MqttProperties.MqttProperty property : msg.variableHeader().properties().listAll()) {
+            if (property.propertyId() == MqttProperties.MqttPropertyType.TOPIC_ALIAS.value()) {
+                continue;
+            }
+            rewrittenProps.add(property);
+        }
+
+        MqttPublishVariableHeader rewrittenVariableHeader =
+            new MqttPublishVariableHeader(translatedTopicName, messageID, rewrittenProps);
+        return new MqttPublishMessage(msg.fixedHeader(), rewrittenVariableHeader, msg.payload());
     }
 
     private Instant extractExpiryFromProperty(MqttPublishMessage msg) {
@@ -710,6 +896,8 @@ final class MQTTConnection {
         postOffice.routeCommand(clientID, "PUBREL", () -> {
             checkMatchSessionLoop(clientID);
             executePubRel(messageID);
+            // increment send quota after send PUBCOMP to the client
+            receivedQuota.releaseSlot();
             return null;
         });
     }
@@ -740,9 +928,10 @@ final class MQTTConnection {
             LOG.debug("Sending message {} on the wire to {}", msg.fixedHeader().messageType(), getClientId());
             // Sending to external, retain a duplicate. Just retain is not
             // enough, since the receiver must have full control.
+            // Retain because the OutboundHandler does a release of the buffer.
             Object retainedDup = msg;
             if (msg instanceof ByteBufHolder) {
-                retainedDup = ((ByteBufHolder) msg).retainedDuplicate();
+                retainedDup = Utils.retainDuplicate((ByteBufHolder) msg, "mqtt connection send PUB");
             }
 
             ChannelFuture channelFuture;

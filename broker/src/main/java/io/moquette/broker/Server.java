@@ -73,7 +73,7 @@ import static io.moquette.logging.LoggingUtils.getInterceptorIds;
 public class Server {
 
     private static final Logger LOG = LoggerFactory.getLogger(io.moquette.broker.Server.class);
-    public static final String MOQUETTE_VERSION = "0.18-SNAPSHOT";
+    public static final String MOQUETTE_VERSION = "0.19-SNAPSHOT";
 
     private ScheduledExecutorService scheduler;
     private NewNettyAcceptor acceptor;
@@ -592,7 +592,7 @@ public class Server {
         }
         LOG.trace("Internal publishing message CId: {}, messageId: {}", clientId, messageID);
         final RoutingResults routingResults = dispatcher.internalPublish(msg);
-        msg.payload().release();
+        Utils.release(msg, "Routing - internal PUB");
         return routingResults;
     }
 

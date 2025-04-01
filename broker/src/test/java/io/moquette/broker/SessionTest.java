@@ -8,10 +8,10 @@ import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.handler.codec.mqtt.MqttQoS;
 import io.netty.handler.codec.mqtt.MqttSubscriptionOption;
 import io.netty.handler.codec.mqtt.MqttVersion;
+import io.netty.util.ReferenceCountUtil;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
-import static io.moquette.BrokerConstants.FLIGHT_BEFORE_RESEND_MS;
 import io.moquette.broker.subscriptions.Subscription;
 
 import java.time.Clock;
@@ -19,10 +19,10 @@ import java.time.Instant;
 import java.util.Arrays;
 import org.assertj.core.api.Assertions;
 
+import static io.moquette.BrokerConstants.*;
 import static io.moquette.broker.Session.INFINITE_EXPIRY;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static io.moquette.BrokerConstants.NO_BUFFER_FLUSH;
 
 public class SessionTest {
 
@@ -66,16 +66,18 @@ public class SessionTest {
         testChannel.close();
     }
 
-    private void sendQoS1To(Session client, Topic destinationTopic, String message) {
+    private ByteBuf sendQoS1To(Session client, Topic destinationTopic, String message) {
         final ByteBuf payload = ByteBufUtil.writeUtf8(UnpooledByteBufAllocator.DEFAULT, message);
         final SessionRegistry.PublishedMessage publishedMessage = new SessionRegistry.PublishedMessage(destinationTopic, MqttQoS.AT_LEAST_ONCE, payload, false, Instant.MAX);
         client.sendPublishOnSessionAtQos(publishedMessage);
+        ReferenceCountUtil.release(payload);
+        return payload;
     }
 
     @Test
     public void testFirstResendOfANotAckedMessage() throws InterruptedException {
         final Topic destinationTopic = new Topic("/a/b");
-        sendQoS1To(client, destinationTopic, "Message not ACK-ed at first send!");
+        ByteBuf payloadCreated = sendQoS1To(client, destinationTopic, "Message not ACK-ed at first send!");
         // verify the first time the message is sent
         ConnectionTestUtils.verifyReceivePublish(testChannel, destinationTopic.toString(), "Message not ACK-ed at first send!");
 
@@ -87,12 +89,14 @@ public class SessionTest {
 
         // verify the first time the message is sent
         ConnectionTestUtils.verifyReceivePublish(testChannel, destinationTopic.toString(), "Message not ACK-ed at first send!");
+
+        ReferenceCountUtil.release(payloadCreated);
     }
 
     @Test
     public void testSecondResendOfANotAckedMessage() throws InterruptedException {
         final Topic destinationTopic = new Topic("/a/b");
-        sendQoS1To(client, destinationTopic, "Message not ACK-ed at first send!");
+        ByteBuf payloadCreated = sendQoS1To(client, destinationTopic, "Message not ACK-ed at first send!");
         // verify the first time the message is sent
         ConnectionTestUtils.verifyReceivePublish(testChannel, destinationTopic.toString(), "Message not ACK-ed at first send!");
 
@@ -113,6 +117,8 @@ public class SessionTest {
 
         // verify the first time the message is sent
         ConnectionTestUtils.verifyReceivePublish(testChannel, destinationTopic.toString(), "Message not ACK-ed at first send!");
+
+        ReferenceCountUtil.release(payloadCreated);
     }
 
     @Test
@@ -128,6 +134,7 @@ public class SessionTest {
     private void createConnection(Session client) {
         BrokerConfiguration brokerConfiguration = new BrokerConfiguration(true, false, false, NO_BUFFER_FLUSH);
         MQTTConnection mqttConnection = new MQTTConnection(testChannel, brokerConfiguration, null, null, null);
+        mqttConnection.assignSendQuota(new LimitedQuota(INFLIGHT_WINDOW_SIZE));
         client.markConnecting();
         client.bind(mqttConnection);
         client.completeConnection();
